@@ -3,6 +3,7 @@
   import { dateTime, invoke, priorityLabels } from './lib/api';
   import type { Catalog, Item, ItemInput, ItemKind } from './lib/api';
   import ItemEditor from './lib/ItemEditor.svelte';
+  import Assistant from './lib/Assistant.svelte';
   import './app.css';
   let filter = $state<'all' | ItemKind>('all');
   let panel = $state<'details' | 'assistant'>('details');
@@ -128,7 +129,7 @@
           </footer>
         {:else}<div class="detail-empty"><p>アイテムを選択すると、詳細を表示します。</p></div>{/if}
       </div>
-      <div class="assistant-panel" hidden={panel !== 'assistant'}><p class="empty">Assistant</p></div>
+      <div class="assistant-panel" hidden={panel !== 'assistant'}><Assistant active={panel === 'assistant'} {focusToken} /></div>
     </section>
   </main>
 </div>

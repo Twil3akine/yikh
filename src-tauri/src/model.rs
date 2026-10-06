@@ -2,15 +2,26 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ItemKind { Task, Bute }
+pub enum ItemKind {
+    Task,
+    Bute,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ItemStatus { Active, Completed }
+pub enum ItemStatus {
+    Active,
+    Completed,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Priority { None, Low, Medium, High }
+pub enum Priority {
+    None,
+    Low,
+    Medium,
+    High,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {

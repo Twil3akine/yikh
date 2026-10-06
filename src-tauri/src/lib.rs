@@ -1,7 +1,9 @@
+mod assistant;
 mod items;
 mod model;
 mod repository;
 
+use assistant::{AssistantSettings, ChatMessage};
 use items::ItemService;
 use model::{Catalog, Item, ItemInput, ItemQuery};
 use tauri::{Manager, State};
@@ -40,12 +42,39 @@ fn item_catalog(service: State<'_, ItemService>) -> Result<Catalog, String> {
     service.catalog()
 }
 
+struct AssistantClient(Result<reqwest::Client, String>);
+
+#[tauri::command]
+fn get_assistant_settings(service: State<'_, ItemService>) -> Result<AssistantSettings, String> {
+    assistant::get_settings(&service)
+}
+
+#[tauri::command]
+fn save_assistant_settings(
+    service: State<'_, ItemService>,
+    settings: AssistantSettings,
+) -> Result<AssistantSettings, String> {
+    assistant::save_settings(&service, settings)
+}
+
+#[tauri::command]
+async fn ask_assistant(
+    service: State<'_, ItemService>,
+    client: State<'_, AssistantClient>,
+    message: String,
+    history: Vec<ChatMessage>,
+) -> Result<String, String> {
+    let client = client.inner().0.as_ref().map_err(Clone::clone)?;
+    assistant::answer(&service, client, message, history).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let directory = app.path().app_data_dir()?;
             std::fs::create_dir_all(&directory)?;
             app.manage(ItemService::open(directory.join("yikh.sqlite3"))?);
+            app.manage(AssistantClient(assistant::http_client()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -54,7 +83,10 @@ pub fn run() {
             update_item,
             complete_item,
             delete_item,
-            item_catalog
+            item_catalog,
+            get_assistant_settings,
+            save_assistant_settings,
+            ask_assistant
         ])
         .run(tauri::generate_context!())
         .expect("Yikhを起動できませんでした");

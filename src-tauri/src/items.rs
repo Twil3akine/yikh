@@ -204,6 +204,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![task.id.as_str()]
         );
+        let active_butes = service
+            .query(&ItemQuery {
+                kind: Some(ItemKind::Bute),
+                status: Some(ItemStatus::Active),
+                ..ItemQuery::default()
+            })
+            .unwrap();
+        assert_eq!(active_butes.len(), 1);
+        assert_eq!(active_butes[0].id, bute.id);
+        for search in ["Review", "North Star", "urgent"] {
+            assert!(service
+                .query(&ItemQuery {
+                    kind: Some(ItemKind::Task),
+                    search: Some(search.into()),
+                    ..ItemQuery::default()
+                })
+                .unwrap()
+                .iter()
+                .any(|item| item.id == task.id));
+        }
+        assert!(service
+            .query(&ItemQuery {
+                search: Some("%_".into()),
+                ..ItemQuery::default()
+            })
+            .unwrap()
+            .is_empty());
         let all_statuses = service
             .query(&ItemQuery {
                 status: None,
