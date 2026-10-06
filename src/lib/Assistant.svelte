@@ -17,7 +17,7 @@
     try { baseUrl = (await invoke<AssistantSettings>('get_assistant_settings')).base_url; }
     catch (cause) { settingsError = String(cause); }
   });
-  $effect(() => { void focusToken; if (active) void tick().then(() => input?.focus()); });
+  $effect(() => { if (active && focusToken > 0) void tick().then(() => input?.focus()); });
   async function scrollToEnd() { await tick(); conversation.scrollTop = conversation.scrollHeight; }
   async function send(event?: SubmitEvent) {
     event?.preventDefault();
@@ -77,24 +77,28 @@
 </div>
 
 <style>
-  .assistant { height: 100%; display: flex; flex-direction: column; min-height: 0; }
-  .connection { padding: 18px 25px; border-bottom: 1px solid #e8eaec; color: #697178; font-size: 12px; }
-  details { margin-top: 10px; }
+  .assistant { width: 100%; height: 100%; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+  .connection { min-width: 0; padding: 14px; border-bottom: 1px solid #e8eaec; color: #697178; font-size: 12px; overflow-wrap: anywhere; }
+  details { min-width: 0; margin-top: 10px; }
   summary { cursor: pointer; width: fit-content; }
-  .settings { margin-top: 12px; display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
-  .settings label { flex: 1; min-width: 220px; display: grid; gap: 7px; }
+  .settings { min-width: 0; margin-top: 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+  .settings label { min-width: 0; display: grid; gap: 7px; }
+  .settings input { width: 100%; min-width: 0; box-sizing: border-box; }
+  .settings button { min-width: 0; }
   .settings p { width: 100%; margin: 0; }
-  .conversation { flex: 1; overflow-y: auto; padding: 24px 28px; }
-  .welcome { margin: 30px 0; max-width: 380px; }
+  .conversation { flex: 1; min-width: 0; overflow: auto; padding: 16px 14px; }
+  .welcome { min-width: 0; margin: 20px 0; max-width: 380px; }
   h2 { font-size: 21px; font-weight: 550; }
   .welcome p { font-size: 14px; line-height: 1.9; }
-  article { padding: 12px 0 20px; border-bottom: 1px solid #eceef0; margin-bottom: 14px; }
+  article { min-width: 0; padding: 12px 0 20px; border-bottom: 1px solid #eceef0; margin-bottom: 14px; }
   article.user h3 { color: #737b82; }
   h3 { font-size: 12px; font-weight: 550; color: #303941; margin: 0 0 10px; }
   article p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.85; margin: 0; }
   .waiting { font-size: 13px; }
-  .compose { padding: 18px 25px 22px; border-top: 1px solid #e8eaec; }
-  .compose textarea { width: 100%; resize: vertical; max-height: 160px; }
-  .send-row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; gap: 10px; }
-  .send-row span { font-size: 11px; }
+  .compose { min-width: 0; padding: 14px; border-top: 1px solid #e8eaec; }
+  .compose form { min-width: 0; }
+  .compose textarea { width: 100%; min-width: 0; box-sizing: border-box; resize: vertical; max-height: 160px; }
+  .send-row { min-width: 0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-top: 10px; gap: 8px; }
+  .send-row span { min-width: 0; flex: 1 1 120px; font-size: 11px; }
+  .compose :global(.error), .connection :global(.error) { overflow-wrap: anywhere; }
 </style>
