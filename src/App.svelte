@@ -188,7 +188,7 @@
     <section id="item-sidebar" class="list-pane" aria-label="アイテム一覧" hidden={!leftOpen} bind:this={listPane}>
       <nav class="tabs list-tabs" aria-label="アイテムの種類">
         {#each [['all', 'All'], ['task', 'Tasks'], ['bute', 'Butes']] as [value, label]}
-          <button class:chosen={filter === value} aria-pressed={filter === value} onclick={() => changeFilter(value as 'all' | ItemKind)}><span>{label}</span><span class="count-badge" aria-label="未完了件数">{counts[value as 'all' | ItemKind]}</span></button>
+          <button class:chosen={filter === value} aria-pressed={filter === value} onclick={() => changeFilter(value as 'all' | ItemKind)}><span>{label}</span><span class="count-badge" aria-label={`${counts[value as 'all' | ItemKind]}件の未完了アイテム`}>{counts[value as 'all' | ItemKind]}</span></button>
         {/each}
       </nav>
       <div class="item-list" aria-busy={loading}>
@@ -196,11 +196,12 @@
         {:else if items.length === 0}<p class="empty">アイテムはありません。</p>
         {:else}{#each items as item (item.id)}
           <button class="item-row" class:selected={selectedId === item.id} class:completed={item.status === 'completed'} aria-pressed={selectedId === item.id}
-            onclick={() => selectedId = item.id}>
+            data-priority={item.priority} title={item.title} onclick={() => selectedId = item.id}>
             <span class="item-title">{item.title}</span>
             <span class="item-meta"><span class="kind" class:bute={item.kind === 'bute'}>{item.kind === 'task' ? 'Task' : 'Bute'}</span>
               {#if item.project}<span class="project">{item.project}</span>{/if}
-              <span class="item-date">{item.status === 'completed' ? '完了済み' : item.due_date ? `締切 ${item.due_date}` : `更新 ${dateTime(item.updated_at).split(' ')[0]}`}</span>
+              {#if item.status === 'completed'}<span class="item-date">完了済み</span>
+              {:else if item.due_date}<span class="item-date">締切 {item.due_date}</span>{/if}
             </span>
           </button>
         {/each}{/if}

@@ -67,7 +67,7 @@
   <div class="compose">
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     <form onsubmit={send}>
-      <textarea bind:this={input} bind:value={draft} aria-label="Assistantへの質問" placeholder="アイテムについて質問する" rows="3" disabled={pending}
+      <textarea bind:this={input} bind:value={draft} aria-label="Assistantへの質問" placeholder="アイテムについて質問する" rows="3" readonly={pending}
         onkeydown={(event) => {
           if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void send(); }
         }}></textarea>
