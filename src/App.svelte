@@ -175,12 +175,16 @@
 <svelte:window onkeydown={keyboard} onresize={fitSidebars} />
 <div class="app">
   <header class="toolbar">
-    <div class="toolbar-group"><h1>Yikh</h1>
-      <button class="sidebar-toggle" aria-expanded={leftOpen} aria-controls="item-sidebar" aria-label={leftOpen ? 'アイテム一覧を閉じる' : 'アイテム一覧を開く'} onclick={toggleLeft}>一覧 <span class="shortcut">⌘B</span></button>
+    <div class="toolbar-group">
+      <button class="icon-button" aria-expanded={leftOpen} aria-controls="item-sidebar" aria-label={leftOpen ? 'アイテム一覧を閉じる' : 'アイテム一覧を開く'} title="アイテム一覧を開閉（⌘B）" onclick={toggleLeft}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></svg>
+      </button>
+      <button class="icon-button add-item" aria-label="新規追加" title="新規追加" onclick={() => openEditor(null)} disabled={working}><span aria-hidden="true">+</span></button>
     </div>
     <div class="toolbar-group">
-      <button class="sidebar-toggle" aria-expanded={assistantOpen} aria-controls="assistant-sidebar" onclick={openAssistant}>Assistant <span class="shortcut">⌘K</span></button>
-      <button class="primary" onclick={() => openEditor(null)} disabled={working}>＋ 新規追加</button>
+      <button class="icon-button" aria-expanded={assistantOpen} aria-controls="assistant-sidebar" aria-label={assistantOpen ? 'Assistantを閉じる' : 'Assistantを開く'} title="Assistantを開く（⌘K）" onclick={() => assistantOpen ? closeAssistant() : openAssistant()}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></svg>
+      </button>
     </div>
   </header>
   {#if error}<div class="app-error" role="alert"><span>{error}</span><button onclick={() => load()}>再読み込み</button></div>{/if}
@@ -249,7 +253,6 @@
         onkeydown={(event) => resizeKey(event, 'right')}></div>
     {/if}
     <section id="assistant-sidebar" class="assistant-pane" aria-label="Assistant" hidden={!assistantOpen} bind:this={assistantPane}>
-      <header class="sidebar-header"><span>Assistant</span><button class="close-sidebar" aria-label="Assistantを閉じる" onclick={closeAssistant}>閉じる</button></header>
       <div class="assistant-panel"><Assistant active={assistantOpen} {focusToken} /></div>
     </section>
   </main>
