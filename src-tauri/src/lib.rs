@@ -1,14 +1,16 @@
 mod assistant;
+mod assistant_tools;
 mod conversations;
 mod items;
 mod model;
 mod repository;
 
 use assistant::{AssistantSettings, ChatMessage};
+use assistant_tools::AssistantTools;
 use conversations::{Conversation, ConversationDetail};
 use items::ItemService;
 use model::{Catalog, Item, ItemInput, ItemQuery};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
 fn list_items(service: State<'_, ItemService>, query: ItemQuery) -> Result<Vec<Item>, String> {
@@ -105,13 +107,21 @@ fn create_conversation(service: State<'_, ItemService>) -> Result<ConversationDe
 #[tauri::command]
 fn get_conversation(
     service: State<'_, ItemService>,
+    tools: State<'_, AssistantTools>,
     id: String,
 ) -> Result<ConversationDetail, String> {
-    service.get_conversation(&id)
+    let mut detail = service.get_conversation(&id)?;
+    detail.pending_action = tools.pending(&id)?;
+    Ok(detail)
 }
 
 #[tauri::command]
-fn delete_conversation(service: State<'_, ItemService>, id: String) -> Result<(), String> {
+fn delete_conversation(
+    service: State<'_, ItemService>,
+    tools: State<'_, AssistantTools>,
+    id: String,
+) -> Result<(), String> {
+    tools.clear(&id)?;
     service.delete_conversation(&id)
 }
 
@@ -119,11 +129,67 @@ fn delete_conversation(service: State<'_, ItemService>, id: String) -> Result<()
 async fn send_conversation_message(
     service: State<'_, ItemService>,
     client: State<'_, AssistantClient>,
+    tools: State<'_, AssistantTools>,
+    app: tauri::AppHandle,
     id: String,
     content: String,
 ) -> Result<ConversationDetail, String> {
     let client = client.inner().0.as_ref().map_err(Clone::clone)?;
-    conversations::send(&service, client, &id, content).await
+    conversations::send_with_tools(&service, client, &id, content, &tools, &|| {
+        let _ = app.emit("items-changed", ());
+    })
+    .await
+}
+
+#[tauri::command]
+fn resolve_assistant_action(
+    service: State<'_, ItemService>,
+    tools: State<'_, AssistantTools>,
+    app: tauri::AppHandle,
+    input: AssistantActionInput,
+) -> Result<ConversationDetail, String> {
+    service.get_conversation(&input.id)?;
+    let result = tools.resolve(
+        &service,
+        &input.id,
+        &input.token,
+        input.candidate_key.as_deref(),
+        input.confirm,
+    )?;
+    if result.changed {
+        let _ = app.emit("items-changed", ());
+    }
+    let message = result
+        .output
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("操作を確認してください。");
+    service.append_assistant_message(&input.id, message)?;
+    let mut detail = service.get_conversation(&input.id)?;
+    detail.pending_action = result.pending;
+    Ok(detail)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssistantActionInput {
+    id: String,
+    token: String,
+    candidate_key: Option<String>,
+    confirm: bool,
+}
+
+#[tauri::command]
+fn cancel_assistant_action(
+    service: State<'_, ItemService>,
+    tools: State<'_, AssistantTools>,
+    id: String,
+    token: String,
+) -> Result<ConversationDetail, String> {
+    service.get_conversation(&id)?;
+    tools.cancel(&id, &token)?;
+    service.append_assistant_message(&id, "操作をキャンセルしました。")?;
+    service.get_conversation(&id)
 }
 
 pub fn run() {
@@ -133,6 +199,7 @@ pub fn run() {
             std::fs::create_dir_all(&directory)?;
             app.manage(ItemService::open(directory.join("yikh.sqlite3"))?);
             app.manage(AssistantClient(assistant::http_client()));
+            app.manage(AssistantTools::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -150,7 +217,9 @@ pub fn run() {
             create_conversation,
             get_conversation,
             delete_conversation,
-            send_conversation_message
+            send_conversation_message,
+            resolve_assistant_action,
+            cancel_assistant_action
         ])
         .run(tauri::generate_context!())
         .expect("Yikhを起動できませんでした");

@@ -12,12 +12,25 @@ export interface Catalog { projects: string[]; tags: string[] }
 export interface ChatMessage { role: 'user' | 'assistant'; content: string }
 export interface Conversation { id: string; title: string; created_at: string; updated_at: string }
 export interface Message extends ChatMessage { id: string; conversation_id: string; created_at: string }
-export interface ConversationDetail { conversation: Conversation; messages: Message[] }
+export interface ActionCandidate {
+  key: string; title: string; kind: ItemKind; project: string | null;
+  scheduled_date: string | null; due_date: string | null; priority: Priority;
+  status: ItemStatus; notes: string;
+}
+export interface PendingAction { token: string; kind: 'select' | 'delete'; message: string; candidates: ActionCandidate[] }
+export interface ConversationDetail { conversation: Conversation; messages: Message[]; pending_action?: PendingAction | null }
 export interface AssistantSettings { base_url: string }
 declare global {
   interface Window {
-    __TAURI__?: { core: { invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> } };
+    __TAURI__?: {
+      core: { invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> };
+      event: { listen(event: string, handler: () => void): Promise<() => void> };
+    };
   }
+}
+export function listenForItemChanges(refresh: () => void): Promise<() => void> {
+  if (!window.__TAURI__) return Promise.reject('デスクトップアプリから開いてください。');
+  return window.__TAURI__.event.listen('items-changed', refresh);
 }
 // Tauri injects this bridge. Persistence and model requests stay in Rust.
 export function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {

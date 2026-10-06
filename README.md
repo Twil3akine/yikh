@@ -18,5 +18,5 @@ SDKROOT="$(xcrun --show-sdk-path)" bun run tauri dev
 Assistantを使う場合は、別のターミナルでllama-serverを起動します。
 
 ```sh
-llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M --port 8000
+llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M --port 8000 --jinja
 ```

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { dateTime, invoke, priorityLabels } from './lib/api';
+  import { dateTime, invoke, priorityLabels, listenForItemChanges } from './lib/api';
   import type { Catalog, Item, ItemInput, ItemKind } from './lib/api';
   import ItemEditor from './lib/ItemEditor.svelte';
   import Assistant from './lib/Assistant.svelte';
@@ -40,7 +40,15 @@
   let deleteDialog: HTMLDialogElement;
   let focusToken = $state(0);
   let requestId = 0;
-  onMount(() => { fitSidebars(); void load(); });
+  onMount(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    fitSidebars(); void load();
+    void listenForItemChanges(() => { void load(); }).then((stop) => {
+      if (disposed) stop(); else unlisten = stop;
+    }).catch((cause) => error = String(cause));
+    return () => { disposed = true; unlisten(); };
+  });
 
   function fitSidebars() {
     if (!layout) return;

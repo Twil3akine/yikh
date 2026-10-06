@@ -76,6 +76,7 @@ impl ItemService {
         Ok(ConversationDetail {
             conversation,
             messages: Vec::new(),
+            pending_action: None,
         })
     }
 
@@ -87,6 +88,7 @@ impl ItemService {
             .map(|(conversation, messages)| ConversationDetail {
                 conversation,
                 messages,
+                pending_action: None,
             })
             .ok_or_else(|| "会話が見つかりません".to_owned())
     }
@@ -449,11 +451,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(crate::conversations::send(
+        let result = runtime.block_on(crate::conversations::send_with_tools(
             &service,
             &http_client().unwrap(),
             &created.conversation.id,
             "質問を残してください".into(),
+            &crate::assistant_tools::AssistantTools::default(),
+            &|| {},
         ));
         assert!(result.is_err());
         let loaded = service.get_conversation(&created.conversation.id).unwrap();

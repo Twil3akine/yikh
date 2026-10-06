@@ -87,7 +87,7 @@
   async function send(event?: SubmitEvent) {
     event?.preventDefault();
     const content = draft.trim();
-    if (!content || busy) return;
+    if (!content || busy || current?.pending_action) return;
     busy = true;
     error = '';
     confirmDelete = false;
@@ -148,6 +148,33 @@
 
   function messageMarkup(message: Message) {
     return message.role === 'assistant' ? renderMarkdown(message.content) : '';
+  }
+
+  async function resolveItemAction(candidateKey: string | null, confirm: boolean) {
+    if (busy || !current?.pending_action) return;
+    const id = current.conversation.id;
+    const token = current.pending_action.token;
+    busy = true; error = '';
+    try {
+      current = await invoke<ConversationDetail>('resolve_assistant_action', { input: { id, token, candidate_key: candidateKey, confirm } });
+      await refreshConversations();
+    } catch (cause) {
+      error = String(cause);
+      try { await loadConversation(id); } catch { /* Keep the existing confirmation and error. */ }
+    } finally {
+      busy = false; await scrollToEnd();
+      if (active) input?.focus();
+    }
+  }
+
+  async function cancelItemAction() {
+    if (busy || !current?.pending_action) return;
+    busy = true; error = '';
+    try {
+      current = await invoke<ConversationDetail>('cancel_assistant_action', { id: current.conversation.id, token: current.pending_action.token });
+      await refreshConversations();
+    } catch (cause) { error = String(cause); }
+    finally { busy = false; if (active) input?.focus(); }
   }
 
   function openLink(event: MouseEvent) {
@@ -212,6 +239,25 @@
         </article>
       {/each}
     {/if}
+    {#if current?.pending_action}
+      <section class="item-confirmation" aria-label="アイテム操作の確認">
+        {#each current.pending_action.candidates as candidate (candidate.key)}
+          {#if current.pending_action.kind === 'select'}
+            <button class="candidate" disabled={busy} onclick={() => resolveItemAction(candidate.key, false)}>
+              <span>{candidate.title}</span>
+              <small>{candidate.kind === 'task' ? 'Task' : 'Bute'}{candidate.status === 'completed' ? '（完了済み）' : ''} / {candidate.project ?? 'プロジェクト未設定'} / 締切 {candidate.due_date ?? '未設定'}{#if candidate.scheduled_date} / 予定 {candidate.scheduled_date}{/if}</small>
+              {#if candidate.notes}<small class="candidate-notes">{candidate.notes}</small>{/if}
+            </button>
+          {:else}
+            <p class="confirmation-target">{candidate.title}<small>{candidate.kind === 'task' ? 'Task' : 'Bute'}{candidate.status === 'completed' ? '（完了済み）' : ''} / {candidate.project ?? 'プロジェクト未設定'} / 締切 {candidate.due_date ?? '未設定'}</small>{#if candidate.notes}<small class="candidate-notes">{candidate.notes}</small>{/if}</p>
+          {/if}
+        {/each}
+        <div class="confirmation-actions">
+          {#if current.pending_action.kind === 'delete'}<button class="danger" disabled={busy} onclick={() => resolveItemAction(null, true)}>削除</button>{/if}
+          <button disabled={busy} onclick={cancelItemAction}>キャンセル</button>
+        </div>
+      </section>
+    {/if}
     {#if sending && pendingQuestion}
       <article class="user"><p>{pendingQuestion}</p></article>
     {/if}
@@ -221,13 +267,13 @@
   <div class="compose">
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     <form onsubmit={send}>
-      <textarea bind:this={input} bind:value={draft} aria-label="質問" placeholder="アイテムについて質問する" rows="3" readonly={busy}
+      <textarea bind:this={input} bind:value={draft} aria-label="質問" placeholder="アイテムについて質問する" rows="3" readonly={busy || !!current?.pending_action}
         oncompositionstart={() => composition.start()}
         oncompositionend={() => composition.end()}
         onkeydown={(event) => {
           if (shouldSendOnEnter(event, composition)) { event.preventDefault(); void send(); }
         }}></textarea>
-      <div class="send-row"><span class="muted">Enterで送信 · Shift + Enterで改行</span><button class="primary" disabled={busy || !draft.trim()}>送信</button></div>
+      <div class="send-row"><span class="muted">Enterで送信 · Shift + Enterで改行</span><button class="primary" disabled={busy || !!current?.pending_action || !draft.trim()}>送信</button></div>
     </form>
   </div>
 </div>
@@ -257,6 +303,13 @@
   article.user { color: #5f6870; }
   article p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.85; margin: 0; }
   .waiting { font-size: 13px; }
+  .item-confirmation { display: grid; gap: 6px; margin: 12px 0; }
+  .candidate { display: grid; gap: 5px; text-align: left; padding: 8px; background: #fafbfc; }
+  .candidate span, .confirmation-target { overflow-wrap: anywhere; font-size: 13px; }
+  .item-confirmation small { display: block; color: #7c858c; font-size: 11px; line-height: 1.6; }
+  .item-confirmation .candidate-notes { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .confirmation-target { margin: 0 0 4px; }
+  .confirmation-actions { display: flex; gap: 6px; }
   .compose { min-width: 0; padding: 14px; border-top: 1px solid #e8eaec; }
   .compose form { min-width: 0; }
   .compose textarea { width: 100%; min-width: 0; box-sizing: border-box; resize: vertical; max-height: 160px; }
