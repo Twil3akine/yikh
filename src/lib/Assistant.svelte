@@ -196,7 +196,7 @@
       <div class="welcome">
         <h2>何から進めますか？</h2>
         <p>保存されたアイテムをもとに、検索・整理や次に進めることを相談できます。</p>
-        <p class="muted">「今週締切のタスクは？」<br />「Rustorchって今どうなってる？」</p>
+        <p class="muted">「今週締切のTaskは？」</p>
       </div>
     {/if}
     {#if current}
