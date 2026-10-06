@@ -1,3 +1,4 @@
+use crate::conversations::{Conversation, Message};
 use crate::model::{Catalog, Item, ItemInput, ItemKind, ItemQuery, ItemStatus, Priority};
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use std::path::Path;
@@ -44,7 +45,22 @@ impl Repository {
                  CREATE TABLE IF NOT EXISTS settings (
                      key TEXT PRIMARY KEY,
                      value TEXT NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS conversations (
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id TEXT PRIMARY KEY,
+                     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                     content TEXT NOT NULL,
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS messages_conversation_created
+                     ON messages(conversation_id, created_at, id);",
             )
             .map_err(db_error)?;
         Ok(Self { connection })
@@ -236,6 +252,157 @@ impl Repository {
         Ok(())
     }
 
+    pub(crate) fn list_conversations(&self) -> Result<Vec<Conversation>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, title, created_at, updated_at FROM conversations
+             ORDER BY updated_at DESC, created_at DESC, id ASC",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], read_conversation)
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub(crate) fn create_conversation(&mut self) -> Result<Conversation, String> {
+        let id = Uuid::new_v4().to_string();
+        let now = timestamp();
+        self.connection
+            .execute(
+                "INSERT INTO conversations(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                params![id, "新しい会話", now, now],
+            )
+            .map_err(db_error)?;
+        self.conversation(&id)?
+            .ok_or_else(|| "会話を保存できませんでした".to_owned())
+    }
+
+    pub(crate) fn get_messages(&self, id: &str) -> Result<Vec<Message>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, conversation_id, role, content, created_at FROM messages
+             WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(db_error)?;
+        let rows = statement.query_map([id], read_message).map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub(crate) fn delete_conversation(&mut self, id: &str) -> Result<(), String> {
+        self.connection
+            .execute("DELETE FROM conversations WHERE id = ?", [id])
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub(crate) fn append_user_message(
+        &mut self,
+        conversation_id: &str,
+        content: &str,
+        title: &str,
+    ) -> Result<Vec<Message>, String> {
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?)",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if !exists {
+            return Err("会話が見つかりません".to_owned());
+        }
+        let is_first: bool = tx
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ?)",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        let id = Uuid::new_v4().to_string();
+        let now = timestamp();
+        tx.execute(
+            "INSERT INTO messages(id, conversation_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)",
+            params![id, conversation_id, content, now],
+        ).map_err(db_error)?;
+        if is_first {
+            tx.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                params![title, now, conversation_id],
+            )
+            .map_err(db_error)?;
+        } else {
+            tx.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                params![now, conversation_id],
+            )
+            .map_err(db_error)?;
+        }
+        let mut statement = tx
+            .prepare(
+                "SELECT id, conversation_id, role, content, created_at FROM messages
+             WHERE conversation_id = ? AND id != ? ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![conversation_id, id], read_message)
+            .map_err(db_error)?;
+        let messages = rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
+        drop(statement);
+        tx.commit().map_err(db_error)?;
+        Ok(messages)
+    }
+
+    pub(crate) fn append_assistant_message(
+        &mut self,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let id = Uuid::new_v4().to_string();
+        let now = timestamp();
+        let changed = tx
+            .execute(
+                "INSERT INTO messages(id, conversation_id, role, content, created_at)
+             SELECT ?, id, 'assistant', ?, ? FROM conversations WHERE id = ?",
+                params![id, content, now, conversation_id],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Err("会話が見つかりません".to_owned());
+        }
+        tx.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            params![now, conversation_id],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)
+    }
+
+    pub(crate) fn conversation_detail(
+        &self,
+        id: &str,
+    ) -> Result<Option<(Conversation, Vec<Message>)>, String> {
+        let Some(conversation) = self.conversation(id)? else {
+            return Ok(None);
+        };
+        Ok(Some((conversation, self.get_messages(id)?)))
+    }
+
+    fn conversation(&self, id: &str) -> Result<Option<Conversation>, String> {
+        self.connection
+            .query_row(
+                "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?",
+                [id],
+                read_conversation,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
     fn get(&self, id: &str) -> Result<Option<Item>, String> {
         let mut item = self
             .connection
@@ -369,6 +536,25 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         updated_at: row.get(10)?,
         completed_at: row.get(11)?,
         tags: Vec::new(),
+    })
+}
+
+fn read_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
+    Ok(Conversation {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
+fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        role: row.get(2)?,
+        content: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 

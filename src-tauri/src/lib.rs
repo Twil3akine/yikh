@@ -1,9 +1,11 @@
 mod assistant;
+mod conversations;
 mod items;
 mod model;
 mod repository;
 
 use assistant::{AssistantSettings, ChatMessage};
+use conversations::{Conversation, ConversationDetail};
 use items::ItemService;
 use model::{Catalog, Item, ItemInput, ItemQuery};
 use tauri::{Manager, State};
@@ -68,6 +70,40 @@ async fn ask_assistant(
     assistant::answer(&service, client, message, history).await
 }
 
+#[tauri::command]
+fn list_conversations(service: State<'_, ItemService>) -> Result<Vec<Conversation>, String> {
+    service.list_conversations()
+}
+
+#[tauri::command]
+fn create_conversation(service: State<'_, ItemService>) -> Result<ConversationDetail, String> {
+    service.create_conversation()
+}
+
+#[tauri::command]
+fn get_conversation(
+    service: State<'_, ItemService>,
+    id: String,
+) -> Result<ConversationDetail, String> {
+    service.get_conversation(&id)
+}
+
+#[tauri::command]
+fn delete_conversation(service: State<'_, ItemService>, id: String) -> Result<(), String> {
+    service.delete_conversation(&id)
+}
+
+#[tauri::command]
+async fn send_conversation_message(
+    service: State<'_, ItemService>,
+    client: State<'_, AssistantClient>,
+    id: String,
+    content: String,
+) -> Result<ConversationDetail, String> {
+    let client = client.inner().0.as_ref().map_err(Clone::clone)?;
+    conversations::send(&service, client, &id, content).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -86,7 +122,12 @@ pub fn run() {
             item_catalog,
             get_assistant_settings,
             save_assistant_settings,
-            ask_assistant
+            ask_assistant,
+            list_conversations,
+            create_conversation,
+            get_conversation,
+            delete_conversation,
+            send_conversation_message
         ])
         .run(tauri::generate_context!())
         .expect("Yikhを起動できませんでした");

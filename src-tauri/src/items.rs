@@ -1,3 +1,4 @@
+use crate::conversations::{conversation_title, Conversation, ConversationDetail, Message};
 use crate::model::{Catalog, Item, ItemInput, ItemQuery};
 use crate::repository::Repository;
 use chrono::NaiveDate;
@@ -60,6 +61,60 @@ impl ItemService {
             .lock()
             .map_err(lock_error)?
             .set_setting(key, value)
+    }
+
+    pub fn list_conversations(&self) -> Result<Vec<Conversation>, String> {
+        self.repository
+            .lock()
+            .map_err(lock_error)?
+            .list_conversations()
+    }
+
+    pub fn create_conversation(&self) -> Result<ConversationDetail, String> {
+        let mut repository = self.repository.lock().map_err(lock_error)?;
+        let conversation = repository.create_conversation()?;
+        Ok(ConversationDetail {
+            conversation,
+            messages: Vec::new(),
+        })
+    }
+
+    pub fn get_conversation(&self, id: &str) -> Result<ConversationDetail, String> {
+        self.repository
+            .lock()
+            .map_err(lock_error)?
+            .conversation_detail(id)?
+            .map(|(conversation, messages)| ConversationDetail {
+                conversation,
+                messages,
+            })
+            .ok_or_else(|| "会話が見つかりません".to_owned())
+    }
+
+    pub fn delete_conversation(&self, id: &str) -> Result<(), String> {
+        self.repository
+            .lock()
+            .map_err(lock_error)?
+            .delete_conversation(id)
+    }
+
+    pub(crate) fn append_user_message(
+        &self,
+        id: &str,
+        content: &str,
+    ) -> Result<Vec<Message>, String> {
+        crate::assistant::validate_message(content)?;
+        self.repository
+            .lock()
+            .map_err(lock_error)?
+            .append_user_message(id, content, &conversation_title(content))
+    }
+
+    pub(crate) fn append_assistant_message(&self, id: &str, content: &str) -> Result<(), String> {
+        self.repository
+            .lock()
+            .map_err(lock_error)?
+            .append_assistant_message(id, content)
     }
 }
 
@@ -294,5 +349,123 @@ mod tests {
             })
             .is_err());
         assert!(service.query(&ItemQuery::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conversations_persist_and_resume_without_changing_existing_items() {
+        let (directory, service) = service();
+        let item = service
+            .create(input(ItemKind::Task, "Keep this item"))
+            .unwrap();
+        let created = service.create_conversation().unwrap();
+        assert_eq!(created.conversation.title, "新しい会話");
+        let prior = service
+            .append_user_message(&created.conversation.id, "  今週の予定を教えて  ")
+            .unwrap();
+        assert!(prior.is_empty());
+        service
+            .append_assistant_message(&created.conversation.id, "予定を確認します。")
+            .unwrap();
+        drop(service);
+
+        let reopened = ItemService::open(directory.path().join("items.sqlite")).unwrap();
+        let loaded = reopened.get_conversation(&created.conversation.id).unwrap();
+        assert_eq!(loaded.conversation.title, "今週の予定を教えて");
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0].role, "user");
+        assert_eq!(loaded.messages[0].content, "  今週の予定を教えて  ");
+        assert_eq!(loaded.messages[1].role, "assistant");
+        assert_eq!(
+            reopened.query(&ItemQuery::default()).unwrap()[0].id,
+            item.id
+        );
+    }
+
+    #[test]
+    fn opening_existing_item_database_adds_conversation_storage() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE items (
+                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+                    notes TEXT NOT NULL, status TEXT NOT NULL, project TEXT,
+                    scheduled_date TEXT, due_date TEXT, priority TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+                );
+                INSERT INTO items VALUES
+                    ('legacy-id', 'task', 'Legacy task', '', 'active', NULL, NULL, NULL,
+                     'none', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', NULL);",
+                )
+                .unwrap();
+        }
+        let reopened = ItemService::open(&path).unwrap();
+        assert_eq!(
+            reopened.query(&ItemQuery::default()).unwrap()[0].title,
+            "Legacy task"
+        );
+        let conversation = reopened.create_conversation().unwrap();
+        assert_eq!(conversation.messages.len(), 0);
+        assert_eq!(reopened.query(&ItemQuery::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_conversation_cascades_only_its_messages() {
+        let (_directory, service) = service();
+        let first = service.create_conversation().unwrap();
+        let second = service.create_conversation().unwrap();
+        service
+            .append_user_message(&first.conversation.id, "質問1")
+            .unwrap();
+        service
+            .append_user_message(&second.conversation.id, "質問2")
+            .unwrap();
+        service.delete_conversation(&first.conversation.id).unwrap();
+        assert!(service.get_conversation(&first.conversation.id).is_err());
+        assert!(service
+            .append_assistant_message(&first.conversation.id, "遅れて届いた回答")
+            .is_err());
+        let remaining = service.get_conversation(&second.conversation.id).unwrap();
+        assert_eq!(remaining.messages.len(), 1);
+        assert_eq!(remaining.messages[0].content, "質問2");
+    }
+
+    #[test]
+    fn failed_assistant_answer_keeps_question_and_item_operations_available() {
+        use crate::assistant::{http_client, save_settings, AssistantSettings};
+
+        let (_directory, service) = service();
+        let created = service.create_conversation().unwrap();
+        save_settings(
+            &service,
+            AssistantSettings {
+                base_url: "http://127.0.0.1:0/v1".into(),
+            },
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(crate::conversations::send(
+            &service,
+            &http_client().unwrap(),
+            &created.conversation.id,
+            "質問を残してください".into(),
+        ));
+        assert!(result.is_err());
+        let loaded = service.get_conversation(&created.conversation.id).unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].role, "user");
+        assert!(service.query(&ItemQuery::default()).unwrap().is_empty());
+        let item = service
+            .create(input(ItemKind::Bute, "Independent item"))
+            .unwrap();
+        assert_eq!(
+            service.complete(&item.id).unwrap().status,
+            ItemStatus::Completed
+        );
     }
 }

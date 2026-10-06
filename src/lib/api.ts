@@ -10,6 +10,9 @@ export interface Item extends ItemInput {
 }
 export interface Catalog { projects: string[]; tags: string[] }
 export interface ChatMessage { role: 'user' | 'assistant'; content: string }
+export interface Conversation { id: string; title: string; created_at: string; updated_at: string }
+export interface Message extends ChatMessage { id: string; conversation_id: string; created_at: string }
+export interface ConversationDetail { conversation: Conversation; messages: Message[] }
 export interface AssistantSettings { base_url: string }
 declare global {
   interface Window {
