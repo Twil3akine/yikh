@@ -16,5 +16,8 @@
     "svelte-check": "^4.3.0",
     "typescript": "~5.9.0",
     "vite": "^7.1.0"
+  },
+  "dependencies": {
+    "marked": "./vendor/marked-16.4.2.tgz"
   }
 }

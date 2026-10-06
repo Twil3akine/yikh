@@ -47,6 +47,28 @@ fn item_catalog(service: State<'_, ItemService>) -> Result<Catalog, String> {
 struct AssistantClient(Result<reqwest::Client, String>);
 
 #[tauri::command]
+fn open_assistant_link(url: String) -> Result<(), String> {
+    let url = reqwest::Url::parse(&url).map_err(|_| "リンクを開けませんでした。".to_owned())?;
+    if !matches!(url.scheme(), "http" | "https" | "mailto") {
+        return Err("この形式のリンクは開けません。".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg(url.as_str())
+            .status()
+            .map_err(|_| "リンクを開けませんでした。".to_owned())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("リンクを開けませんでした。".to_owned())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err("この環境ではリンクを開けません。".to_owned())
+}
+
+#[tauri::command]
 fn get_assistant_settings(service: State<'_, ItemService>) -> Result<AssistantSettings, String> {
     assistant::get_settings(&service)
 }
@@ -123,6 +145,7 @@ pub fn run() {
             get_assistant_settings,
             save_assistant_settings,
             ask_assistant,
+            open_assistant_link,
             list_conversations,
             create_conversation,
             get_conversation,

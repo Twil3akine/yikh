@@ -18,8 +18,8 @@ textarea { resize: vertical; line-height: 1.65; }
 .app { height: 100dvh; display: flex; flex-direction: column; }
 .toolbar { height: 48px; flex-shrink: 0; border-bottom: 1px solid #e2e6e8; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; background: #fafbfc; }
 .toolbar-group { display: flex; align-items: center; gap: 6px; }
-.icon-button { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border-color: transparent; background: transparent; padding: 5px; }
-.icon-button svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+.toolbar .icon-button { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border-color: transparent; background: transparent; padding: 5px; }
+.toolbar .icon-button svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.5; }
 .add-item { font-size: 24px; font-weight: 300; }
 .app-error { background: #fff5f4; color: #a53838; border-bottom: 1px solid #edd6d4; padding: 10px 25px; display: flex; align-items: center; justify-content: space-between; gap: 20px; font-size: 13px; }
 main { display: flex; min-height: 0; min-width: 0; flex: 1; overflow: hidden; }
