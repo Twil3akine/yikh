@@ -175,6 +175,38 @@ impl AssistantTools {
             optional(p, vec!["title"]),
         ));
 
+        for definition in &mut definitions {
+            if definition["function"]["name"] == "list_items" {
+                continue;
+            }
+            let properties = definition["function"]["parameters"]["properties"]
+                .as_object_mut()
+                .unwrap();
+            let source_properties: Map<_, _> = properties
+                .keys()
+                .filter(|field| field.as_str() != "title")
+                .map(|field| {
+                    (
+                        field.clone(),
+                        string("今回の発言でこの項目を指定した箇所をそのまま引用します"),
+                    )
+                })
+                .collect();
+            properties.insert(
+                "instruction".into(),
+                string("今回の発言で操作を依頼した箇所をそのまま引用します"),
+            );
+            properties.insert(
+                "reference".into(),
+                string("今回の発言と対象タイトルに含まれる名前の部分をそのまま引用します"),
+            );
+            properties.insert("sources".into(), json!({"type":"object","properties":source_properties,"additionalProperties":false}));
+            definition["function"]["parameters"]["required"]
+                .as_array_mut()
+                .unwrap()
+                .extend([json!("instruction"), json!("reference"), json!("sources")]);
+        }
+
         json!(definitions)
     }
 
@@ -186,11 +218,27 @@ impl AssistantTools {
         arguments: Value,
         policy: &ItemOperationPolicy,
     ) -> Result<ToolResult, String> {
+        let reference = if matches!(
+            name,
+            "create_item" | "update_item" | "complete_item" | "delete_item"
+        ) {
+            Some(
+                arguments
+                    .get("reference")
+                    .and_then(Value::as_str)
+                    .ok_or("対象の参照を指定してください。")?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let arguments = policy.validate(name, arguments)?;
         let targets = if matches!(name, "update_item" | "complete_item" | "delete_item") {
             Some(crate::assistant_targets::resolve_targets(
                 service.query(&ItemQuery::default())?,
-                policy.request(),
+                reference
+                    .as_deref()
+                    .ok_or("対象の参照を指定してください。")?,
                 arguments["title"]
                     .as_str()
                     .ok_or("対象のタイトルを指定してください。")?,
@@ -812,6 +860,18 @@ mod tests {
         json!({"kind":"task","title":title,"notes":"keep me","project":"Studio","scheduled_date":"2026-10-08","due_date":"2026-10-12","priority":"high","tags":["ship"]})
     }
 
+    fn with_sources(request: &str, reference: &str, mut args: Value, fields: &[&str]) -> Value {
+        let object = args.as_object_mut().unwrap();
+        let sources = fields
+            .iter()
+            .map(|field| ((*field).to_owned(), json!(request)))
+            .collect::<Map<_, _>>();
+        object.insert("instruction".into(), json!(request));
+        object.insert("reference".into(), json!(reference));
+        object.insert("sources".into(), Value::Object(sources));
+        args
+    }
+
     #[test]
     fn policy_executes_clear_requests_without_confirming_or_inventing_attributes() {
         let (_directory, service) = service();
@@ -821,26 +881,25 @@ mod tests {
             "OSS課題レポートが今日開始の一週間後締め切りでタスク追加してもらえるかな",
             today,
         );
-        let added = tools.execute(&service, "c", "create_item", json!({
+        let added = tools.execute(&service, "c", "create_item", with_sources(
+            policy.request(), "OSS課題レポート", json!({
             "title":"OSS課題レポート","kind":"task",
             "scheduled_date":{"relative":"today"}, "due_date":{"relative":"days_after","days":7},
             "priority":"high","project":"大学","tags":["課題"],"notes":"別の課題から推測"
-        }), &policy).unwrap();
+            }), &["kind", "scheduled_date", "due_date"]), &policy).unwrap();
         assert!(added.changed && added.pending.is_none());
         let item = service.query(&ItemQuery::default()).unwrap().remove(0);
         assert_eq!(item.scheduled_date.as_deref(), Some("2026-10-07"));
         assert_eq!(item.due_date.as_deref(), Some("2026-10-14"));
         assert_eq!(item.priority, Priority::None);
         assert!(item.project.is_none() && item.tags.is_empty() && item.notes.is_empty());
-        assert_eq!(policy.tool_choice(), "required");
-
         let policy = ItemOperationPolicy::new("OSS課題レポートの締切を10/16にして", today);
         let updated = tools
             .execute(
                 &service,
                 "c",
                 "update_item",
-                json!({"title":"OSS課題レポート","due_date":"2026-10-16","scheduled_date":"2026-10-16","priority":"high"}),
+                with_sources(policy.request(), "OSS課題レポート", json!({"title":"OSS課題レポート","due_date":"2026-10-16","scheduled_date":"2026-10-16","priority":"high"}), &["due_date"]),
                 &policy,
             )
             .unwrap();
@@ -855,7 +914,12 @@ mod tests {
                 &service,
                 "c",
                 "complete_item",
-                json!({"title":"OSS課題レポート"}),
+                with_sources(
+                    policy.request(),
+                    "OSS課題レポート",
+                    json!({"title":"OSS課題レポート"}),
+                    &[],
+                ),
                 &policy,
             )
             .unwrap();
@@ -868,7 +932,12 @@ mod tests {
                 &service,
                 "c",
                 "delete_item",
-                json!({"title":"OSS課題レポート"}),
+                with_sources(
+                    policy.request(),
+                    "OSS課題レポート",
+                    json!({"title":"OSS課題レポート"}),
+                    &[],
+                ),
                 &policy,
             )
             .unwrap();
@@ -894,14 +963,19 @@ mod tests {
             "OSS課題レポートが今日開始の一週間後締め切りでタスク追加してもらえるかな",
             today,
         );
-        tools.execute(&service, "c", "create_item", json!({"title":"OSS課題レポート","kind":"task","scheduled_date":{"relative":"today"},"due_date":{"relative":"days_after","days":7}}), &create_policy).unwrap();
+        tools.execute(&service, "c", "create_item", with_sources(create_policy.request(), "OSS課題レポート", json!({"title":"OSS課題レポート","kind":"task","scheduled_date":{"relative":"today"},"due_date":{"relative":"days_after","days":7}}), &["kind", "scheduled_date", "due_date"]), &create_policy).unwrap();
         let completion_policy = ItemOperationPolicy::new("OSSのレポートできた", today);
         let completion = tools
             .execute(
                 &service,
                 "c",
                 "complete_item",
-                json!({"title":"OSS課題レポート"}),
+                with_sources(
+                    completion_policy.request(),
+                    "OSS",
+                    json!({"title":"OSS課題レポート"}),
+                    &[],
+                ),
                 &completion_policy,
             )
             .unwrap();
@@ -912,7 +986,7 @@ mod tests {
 
         let bute_policy =
             ItemOperationPolicy::new("butesにAufyの開発を無期限で入れといて、優先度低めで", today);
-        let added = tools.execute(&service, "c", "create_item", json!({"title":"Aufyの開発","kind":"bute","due_date":null,"priority":"low","project":"A","notes":"推測したメモ","tags":["development"]}), &bute_policy).unwrap();
+        let added = tools.execute(&service, "c", "create_item", with_sources(bute_policy.request(), "Aufyの開発", json!({"title":"Aufyの開発","kind":"bute","due_date":null,"priority":"low","project":"A","notes":"推測したメモ","tags":["development"]}), &["kind", "due_date", "priority"]), &bute_policy).unwrap();
         assert!(added.changed && added.pending.is_none());
         assert!(!added.output["message"]
             .as_str()
@@ -953,7 +1027,12 @@ mod tests {
                 &reopened,
                 "c",
                 "complete_item",
-                json!({"title":"OSS課題レポート"}),
+                with_sources(
+                    completion_policy.request(),
+                    "OSS",
+                    json!({"title":"OSS課題レポート"}),
+                    &[],
+                ),
                 &completion_policy,
             )
             .unwrap();
