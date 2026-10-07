@@ -1,3 +1,4 @@
+use crate::assistant_policy::{date_schema, ItemOperationPolicy};
 use crate::items::ItemService;
 use crate::model::{Item, ItemInput, ItemKind, ItemQuery, ItemStatus, Priority};
 use chrono::NaiveDate;
@@ -111,8 +112,8 @@ impl AssistantTools {
             "project".into(),
             string("プロジェクト名。省略時は未設定です"),
         );
-        p.insert("scheduled_date".into(), string("予定日 YYYY-MM-DD"));
-        p.insert("due_date".into(), string("締切日 YYYY-MM-DD"));
+        p.insert("scheduled_date".into(), date_schema(false));
+        p.insert("due_date".into(), date_schema(false));
         p.insert(
             "priority".into(),
             json!({"type":"string","enum":["none","low","medium","high"]}),
@@ -123,7 +124,7 @@ impl AssistantTools {
         );
         definitions.push(function(
             "create_item",
-            "アイテムを追加します。",
+            "タイトルと種類が分かれば確認せず追加します。任意項目はユーザーが指定したものだけ渡してください。",
             optional(p, vec!["kind", "title"]),
         ));
 
@@ -142,14 +143,8 @@ impl AssistantTools {
             "project".into(),
             json!({"type":["string","null"],"description":"変更後のプロジェクト。nullで解除"}),
         );
-        p.insert(
-            "scheduled_date".into(),
-            json!({"type":["string","null"],"description":"変更後の予定日 YYYY-MM-DD。nullで解除"}),
-        );
-        p.insert(
-            "due_date".into(),
-            json!({"type":["string","null"],"description":"変更後の締切日 YYYY-MM-DD。nullで解除"}),
-        );
+        p.insert("scheduled_date".into(), date_schema(true));
+        p.insert("due_date".into(), date_schema(true));
         p.insert(
             "priority".into(),
             json!({"type":"string","enum":["none","low","medium","high"]}),
@@ -160,7 +155,7 @@ impl AssistantTools {
         );
         definitions.push(function(
             "update_item",
-            "タイトルで指定したアイテムの指定項目だけを更新します。",
+            "一意の対象は確認せず、指定項目だけを更新します。同名の場合はアプリが候補選択を表示します。",
             optional(p, vec!["title"]),
         ));
 
@@ -168,7 +163,7 @@ impl AssistantTools {
         p.insert("title".into(), string("完了するアイテムの現在のタイトル"));
         definitions.push(function(
             "complete_item",
-            "タイトルで指定したアイテムを完了にします。",
+            "一意の対象は確認せず完了にします。同名の場合はアプリが候補選択を表示します。",
             optional(p, vec!["title"]),
         ));
 
@@ -184,6 +179,18 @@ impl AssistantTools {
     }
 
     pub fn execute(
+        &self,
+        service: &ItemService,
+        conversation_id: &str,
+        name: &str,
+        arguments: Value,
+        policy: &ItemOperationPolicy,
+    ) -> Result<ToolResult, String> {
+        let arguments = policy.validate(name, arguments)?;
+        self.execute_validated(service, conversation_id, name, arguments)
+    }
+
+    fn execute_validated(
         &self,
         service: &ItemService,
         conversation_id: &str,
@@ -777,15 +784,88 @@ mod tests {
     }
 
     #[test]
+    fn policy_executes_clear_requests_without_confirming_or_inventing_attributes() {
+        let (_directory, service) = service();
+        let tools = AssistantTools::default();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let policy = ItemOperationPolicy::new(
+            "OSS課題レポートが今日開始の一週間後締め切りでタスク追加してもらえるかな",
+            today,
+        );
+        let added = tools.execute(&service, "c", "create_item", json!({
+            "title":"OSS課題レポート","kind":"task",
+            "scheduled_date":{"relative":"today"}, "due_date":{"relative":"days_after","days":7},
+            "priority":"high","project":"大学","tags":["課題"],"notes":"別の課題から推測"
+        }), &policy).unwrap();
+        assert!(added.changed && added.pending.is_none());
+        let item = service.query(&ItemQuery::default()).unwrap().remove(0);
+        assert_eq!(item.scheduled_date.as_deref(), Some("2026-10-07"));
+        assert_eq!(item.due_date.as_deref(), Some("2026-10-14"));
+        assert_eq!(item.priority, Priority::None);
+        assert!(item.project.is_none() && item.tags.is_empty() && item.notes.is_empty());
+        assert_eq!(policy.tool_choice()["function"]["name"], "create_item");
+
+        let policy = ItemOperationPolicy::new("OSS課題レポートの締切を10/16にして", today);
+        let updated = tools
+            .execute(
+                &service,
+                "c",
+                "update_item",
+                json!({"title":"OSS課題レポート","due_date":"2026-10-16","scheduled_date":"2026-10-16","priority":"high"}),
+                &policy,
+            )
+            .unwrap();
+        assert!(updated.changed && updated.pending.is_none());
+        assert_eq!(updated.output["item"]["scheduled_date"], "2026-10-07");
+        assert_eq!(updated.output["item"]["due_date"], "2026-10-16");
+        assert_eq!(updated.output["item"]["priority"], "none");
+
+        let policy = ItemOperationPolicy::new("OSS課題レポート終わった", today);
+        let completed = tools
+            .execute(
+                &service,
+                "c",
+                "complete_item",
+                json!({"title":"OSS課題レポート"}),
+                &policy,
+            )
+            .unwrap();
+        assert!(completed.changed && completed.pending.is_none());
+        assert_eq!(completed.output["item"]["status"], "completed");
+
+        let policy = ItemOperationPolicy::new("OSS課題レポートを削除して", today);
+        let deletion = tools
+            .execute(
+                &service,
+                "c",
+                "delete_item",
+                json!({"title":"OSS課題レポート"}),
+                &policy,
+            )
+            .unwrap();
+        assert!(!deletion.changed);
+        let pending = deletion.pending.unwrap();
+        assert_eq!(pending.kind, "delete");
+        assert!(tools
+            .resolve(&service, "c", &pending.token, None, false)
+            .is_err());
+        assert_eq!(service.query(&ItemQuery::default()).unwrap().len(), 1);
+        tools
+            .resolve(&service, "c", &pending.token, None, true)
+            .unwrap();
+        assert!(service.query(&ItemQuery::default()).unwrap().is_empty());
+    }
+
+    #[test]
     fn dispatch_create_patch_preserves_omitted_fields_complete_and_exact_filters() {
         let (_directory, service) = service();
         let tools = AssistantTools::default();
         let created = tools
-            .execute(&service, "c1", "create_item", create_args("Release"))
+            .execute_validated(&service, "c1", "create_item", create_args("Release"))
             .unwrap();
         assert!(created.changed);
         let filtered = tools
-            .execute(
+            .execute_validated(
                 &service,
                 "c1",
                 "list_items",
@@ -796,7 +876,7 @@ mod tests {
         assert!(filtered.output.to_string().find("id").is_none());
 
         let updated = tools
-            .execute(
+            .execute_validated(
                 &service,
                 "c1",
                 "update_item",
@@ -808,10 +888,10 @@ mod tests {
         assert_eq!(updated.output["item"]["scheduled_date"], "2026-10-08");
         assert_eq!(updated.output["item"]["priority"], "high");
         assert!(tools
-            .execute(&service, "c1", "update_item", json!({"title":"Release"}))
+            .execute_validated(&service, "c1", "update_item", json!({"title":"Release"}))
             .is_err());
         let cleared = tools
-            .execute(
+            .execute_validated(
                 &service,
                 "c1",
                 "update_item",
@@ -821,7 +901,7 @@ mod tests {
         assert!(cleared.output["item"]["scheduled_date"].is_null());
         assert_eq!(cleared.output["item"]["due_date"], "2026-10-12");
         let completed = tools
-            .execute(&service, "c1", "complete_item", json!({"title":"Release"}))
+            .execute_validated(&service, "c1", "complete_item", json!({"title":"Release"}))
             .unwrap();
         assert_eq!(completed.output["item"]["status"], "completed");
     }
@@ -831,10 +911,10 @@ mod tests {
         let (_directory, service) = service();
         let tools = AssistantTools::default();
         tools
-            .execute(&service, "a", "create_item", create_args("Delete me"))
+            .execute_validated(&service, "a", "create_item", create_args("Delete me"))
             .unwrap();
         let pending = tools
-            .execute(&service, "a", "delete_item", json!({"title":"Delete me"}))
+            .execute_validated(&service, "a", "delete_item", json!({"title":"Delete me"}))
             .unwrap()
             .pending
             .unwrap();
@@ -868,7 +948,7 @@ mod tests {
         tools.cancel("a", &pending.token).unwrap();
 
         let next = tools
-            .execute(&service, "a", "delete_item", json!({"title":"Delete me"}))
+            .execute_validated(&service, "a", "delete_item", json!({"title":"Delete me"}))
             .unwrap()
             .pending
             .unwrap();
@@ -877,7 +957,7 @@ mod tests {
             .resolve(&service, "a", &next.token, None, true)
             .is_err());
         let final_confirmation = tools
-            .execute(&service, "a", "delete_item", json!({"title":"Delete me"}))
+            .execute_validated(&service, "a", "delete_item", json!({"title":"Delete me"}))
             .unwrap()
             .pending
             .unwrap();
@@ -896,19 +976,21 @@ mod tests {
         let (_directory, service) = service();
         let tools = AssistantTools::default();
         tools
-            .execute(&service, "a", "create_item", create_args("Same"))
+            .execute_validated(&service, "a", "create_item", create_args("Same"))
             .unwrap();
         let mut other = create_args("Same");
         other["kind"] = json!("bute");
         other["project"] = json!("Other");
-        tools.execute(&service, "a", "create_item", other).unwrap();
+        tools
+            .execute_validated(&service, "a", "create_item", other)
+            .unwrap();
 
         for (name, args) in [
             ("update_item", json!({"title":"Same","notes":"chosen only"})),
             ("complete_item", json!({"title":"Same"})),
         ] {
             let pending = tools
-                .execute(&service, "a", name, args)
+                .execute_validated(&service, "a", name, args)
                 .unwrap()
                 .pending
                 .unwrap();
@@ -957,7 +1039,7 @@ mod tests {
         }
 
         let pending = tools
-            .execute(&service, "a", "delete_item", json!({"title":"same"}))
+            .execute_validated(&service, "a", "delete_item", json!({"title":"same"}))
             .unwrap()
             .pending
             .unwrap();
