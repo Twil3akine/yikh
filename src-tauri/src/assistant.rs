@@ -288,20 +288,7 @@ async fn run(
         )
         .await?;
         if response.tool_calls.is_empty() {
-            if tools.is_some() && policy.requires_operation() {
-                return Err("依頼されたToolが呼び出されなかったため、操作は実行していません。llama-serverのTool Calling設定を確認してください。".into());
-            }
-            let content = response
-                .content
-                .filter(|text| !text.trim().is_empty())
-                .ok_or_else(|| "ローカルのOrnithサーバーから空の回答が返されました。".to_owned())?;
-            if content.contains("<tool_call>") {
-                return Err("Tool Callを読み取れませんでした。llama-serverを --jinja 付きで起動してください。".into());
-            }
-            return Ok(AssistantReply {
-                content,
-                pending: None,
-            });
+            return text_reply(response, &policy, tools.is_some());
         }
         let Some(tools) = tools.as_ref() else {
             return Err("この要求ではItemを変更できません。".into());
@@ -318,6 +305,67 @@ async fn run(
         }
     }
     Err("Tool処理の回数が上限に達しました。依頼を短くしてお試しください。".into())
+}
+
+fn text_reply(
+    response: CompletionAnswer,
+    policy: &ItemOperationPolicy,
+    tools_available: bool,
+) -> Result<AssistantReply, String> {
+    if tools_available && policy.requires_operation() {
+        return Err("依頼されたToolが呼び出されなかったため、操作は実行していません。llama-serverのTool Calling設定を確認してください。".into());
+    }
+    let content = response
+        .content
+        .filter(|text| !text.trim().is_empty())
+        .ok_or("ローカルのOrnithサーバーから空の回答が返されました。")?;
+    if content.contains("<tool_call>") {
+        return Err(
+            "Tool Callを読み取れませんでした。llama-serverを --jinja 付きで起動してください。"
+                .into(),
+        );
+    }
+    // A successful write returns directly from apply_calls/resolve using the Rust
+    // result. Free model text has no authority to confirm a write, even if intent
+    // recognition failed or the server did not produce a structured tool call.
+    let compact: String = content
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '*')
+        .collect();
+    let claims_write = [
+        "追加", "作成", "登録", "更新", "変更", "編集", "削除", "完了", "設定",
+    ]
+    .iter()
+    .any(|operation| {
+        [
+            "しました",
+            "いたしました",
+            "しておきました",
+            "しておいた",
+            "したよ",
+            "を実行しました",
+        ]
+        .iter()
+        .any(|ending| compact.contains(&format!("{operation}{ending}")))
+    }) || [
+        "追加完了",
+        "作成完了",
+        "更新完了",
+        "削除完了",
+        "登録完了",
+        "入れました",
+        "入れておきました",
+        "終わらせました",
+    ]
+    .iter()
+    .any(|phrase| compact.contains(phrase));
+    if claims_write {
+        return Err("Itemの変更は実行していません。実行結果のない成功回答は表示できません。対象と操作を指定して、もう一度送信してください。".into());
+    }
+    Ok(AssistantReply {
+        content,
+        pending: None,
+    })
 }
 
 fn apply_calls(
@@ -572,6 +620,45 @@ mod tests {
         assert!(snapshot.contains("updated_at"));
         assert!(!snapshot.contains("item-1"));
         assert!(!snapshot.contains("\"id\""));
+    }
+
+    #[test]
+    fn model_text_cannot_claim_item_writes_without_a_tool_result() {
+        use super::{text_reply, CompletionAnswer};
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        // An unknown formulation takes the read-only route: it still cannot report a write.
+        let policy = crate::assistant_policy::ItemOperationPolicy::new("いい感じによろしく", today);
+        for content in [
+            "OSS課題レポートのタスクを完了しました。",
+            "Buteを追加しました。\nタイトル: Aufyの開発\nプロジェクト: A",
+            "「課題」を**追加しました**。",
+        ] {
+            assert!(text_reply(
+                CompletionAnswer {
+                    content: Some(content.into()),
+                    tool_calls: vec![]
+                },
+                &policy,
+                true
+            )
+            .is_err());
+        }
+        let response = CompletionAnswer {
+            content: Some("レポートは完了済みです。".into()),
+            tool_calls: vec![],
+        };
+        assert!(text_reply(response, &policy, true).is_ok());
+        let policy =
+            crate::assistant_policy::ItemOperationPolicy::new("Aufyの開発を入れといて", today);
+        assert!(text_reply(
+            CompletionAnswer {
+                content: Some("作成しますか？".into()),
+                tool_calls: vec![]
+            },
+            &policy,
+            true
+        )
+        .is_err());
     }
 
     #[test]

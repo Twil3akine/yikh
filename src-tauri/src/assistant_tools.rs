@@ -112,8 +112,8 @@ impl AssistantTools {
             "project".into(),
             string("プロジェクト名。省略時は未設定です"),
         );
-        p.insert("scheduled_date".into(), date_schema(false));
-        p.insert("due_date".into(), date_schema(false));
+        p.insert("scheduled_date".into(), date_schema(true));
+        p.insert("due_date".into(), date_schema(true));
         p.insert(
             "priority".into(),
             json!({"type":"string","enum":["none","low","medium","high"]}),
@@ -187,15 +187,38 @@ impl AssistantTools {
         policy: &ItemOperationPolicy,
     ) -> Result<ToolResult, String> {
         let arguments = policy.validate(name, arguments)?;
-        self.execute_validated(service, conversation_id, name, arguments)
+        let targets = if matches!(name, "update_item" | "complete_item" | "delete_item") {
+            Some(crate::assistant_targets::resolve_targets(
+                service.query(&ItemQuery::default())?,
+                policy.request(),
+                arguments["title"]
+                    .as_str()
+                    .ok_or("対象のタイトルを指定してください。")?,
+            )?)
+        } else {
+            None
+        };
+        self.dispatch(service, conversation_id, name, arguments, targets)
     }
 
+    #[cfg(test)]
     fn execute_validated(
         &self,
         service: &ItemService,
         conversation_id: &str,
         name: &str,
         arguments: Value,
+    ) -> Result<ToolResult, String> {
+        self.dispatch(service, conversation_id, name, arguments, None)
+    }
+
+    fn dispatch(
+        &self,
+        service: &ItemService,
+        conversation_id: &str,
+        name: &str,
+        arguments: Value,
+        targets: Option<Vec<Item>>,
     ) -> Result<ToolResult, String> {
         let mut pending = self
             .pending
@@ -209,7 +232,10 @@ impl AssistantTools {
             "create_item" => create_item(service, arguments),
             "update_item" => {
                 let (title, patch) = update_arguments(arguments)?;
-                let matches = exact_title_matches(service, &title)?;
+                let matches = match targets {
+                    Some(items) => items,
+                    None => exact_title_matches(service, &title)?,
+                };
                 match matches.len() {
                     0 => Err("該当するアイテムが見つかりません".to_owned()),
                     1 => update_one(service, &matches[0], patch),
@@ -233,7 +259,10 @@ impl AssistantTools {
             "complete_item" | "delete_item" => {
                 let args = object(arguments, &["title"])?;
                 let title = required_string(&args, "title")?;
-                let matches = exact_title_matches(service, &title)?;
+                let matches = match targets {
+                    Some(items) => items,
+                    None => exact_title_matches(service, &title)?,
+                };
                 match matches.len() {
                     0 => Err("該当するアイテムが見つかりません".to_owned()),
                     1 if name == "complete_item" => complete_one(service, &matches[0]),
@@ -854,6 +883,92 @@ mod tests {
             .resolve(&service, "c", &pending.token, None, true)
             .unwrap();
         assert!(service.query(&ItemQuery::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reported_completion_and_bute_creation_persist_the_actual_results() {
+        let (directory, service) = service();
+        let tools = AssistantTools::default();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let create_policy = ItemOperationPolicy::new(
+            "OSS課題レポートが今日開始の一週間後締め切りでタスク追加してもらえるかな",
+            today,
+        );
+        tools.execute(&service, "c", "create_item", json!({"title":"OSS課題レポート","kind":"task","scheduled_date":{"relative":"today"},"due_date":{"relative":"days_after","days":7}}), &create_policy).unwrap();
+        let completion_policy = ItemOperationPolicy::new("OSSのレポートできた", today);
+        let completion = tools
+            .execute(
+                &service,
+                "c",
+                "complete_item",
+                json!({"title":"OSS課題レポート"}),
+                &completion_policy,
+            )
+            .unwrap();
+        assert!(completion.changed && completion.pending.is_none());
+        let completed = service.query(&ItemQuery::default()).unwrap().remove(0);
+        assert_eq!(completed.status, ItemStatus::Completed);
+        assert!(completed.completed_at.is_some());
+
+        let bute_policy =
+            ItemOperationPolicy::new("butesにAufyの開発を無期限で入れといて、優先度低めで", today);
+        let added = tools.execute(&service, "c", "create_item", json!({"title":"Aufyの開発","kind":"bute","due_date":null,"priority":"low","project":"A","notes":"推測したメモ","tags":["development"]}), &bute_policy).unwrap();
+        assert!(added.changed && added.pending.is_none());
+        assert!(!added.output["message"]
+            .as_str()
+            .unwrap()
+            .contains("プロジェクト"));
+        drop(service);
+        let reopened = ItemService::open(directory.path().join("items.sqlite")).unwrap();
+        let items = reopened.query(&ItemQuery::default()).unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.title == "Aufyの開発")
+            .unwrap();
+        assert_eq!(item.kind, ItemKind::Bute);
+        assert_eq!(item.priority, Priority::Low);
+        assert!(
+            item.due_date.is_none()
+                && item.project.is_none()
+                && item.tags.is_empty()
+                && item.notes.is_empty()
+        );
+        let completed = items
+            .iter()
+            .find(|item| item.title == "OSS課題レポート")
+            .unwrap();
+        assert_eq!(completed.status, ItemStatus::Completed);
+
+        // A model-proposed full title must not bypass ambiguity in the user's alias.
+        tools
+            .execute_validated(
+                &reopened,
+                "c",
+                "create_item",
+                create_args("OSS研究レポート"),
+            )
+            .unwrap();
+        let pending = tools
+            .execute(
+                &reopened,
+                "c",
+                "complete_item",
+                json!({"title":"OSS課題レポート"}),
+                &completion_policy,
+            )
+            .unwrap();
+        assert!(!pending.changed);
+        assert_eq!(pending.pending.unwrap().candidates.len(), 2);
+        assert_eq!(
+            reopened
+                .query(&ItemQuery {
+                    status: Some(ItemStatus::Active),
+                    ..ItemQuery::default()
+                })
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

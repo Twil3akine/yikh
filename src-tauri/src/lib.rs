@@ -1,5 +1,6 @@
 mod assistant;
 mod assistant_policy;
+mod assistant_targets;
 mod assistant_tools;
 mod conversations;
 mod items;

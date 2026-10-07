@@ -21,6 +21,10 @@ impl ItemOperationPolicy {
                     "追加したい",
                     "登録して",
                     "作成して",
+                    "作って",
+                    "入れて",
+                    "入れといて",
+                    "登録お願い",
                     "add ",
                     "create ",
                 ][..],
@@ -43,6 +47,8 @@ impl ItemOperationPolicy {
                 &[
                     "終わった",
                     "終わりました",
+                    "できた",
+                    "できました",
                     "完了した",
                     "完了しました",
                     "完了して",
@@ -78,6 +84,9 @@ impl ItemOperationPolicy {
                     "完了したら",
                     "完了している",
                     "完了してる",
+                    "できたか",
+                    "できましたか",
+                    "できたら",
                     "よね",
                     "ですか",
                 ]
@@ -143,6 +152,10 @@ impl ItemOperationPolicy {
         self.operation.is_some()
     }
 
+    pub fn request(&self) -> &str {
+        &self.request
+    }
+
     pub fn validate(&self, name: &str, arguments: Value) -> Result<Value, String> {
         if !self.allows(name) {
             return Err("今回の依頼では、このItem操作を実行できません。".into());
@@ -161,9 +174,13 @@ impl ItemOperationPolicy {
                 .get("title")
                 .and_then(Value::as_str)
                 .ok_or("対象のタイトルを指定してください。")?;
-            if title.trim().is_empty() || !self.request.contains(&title.to_lowercase()) {
+            if title.trim().is_empty()
+                || (name == "create_item" && !self.request.contains(&title.to_lowercase()))
+            {
                 return Err("依頼に含まれるItemのタイトルを指定してください。".into());
             }
+            // Existing targets, including shortened names, are independently resolved
+            // against the current request by the tool dispatcher before any write.
             // A word in the target title is not a request to set that attribute.
             field_policy.request = self.request.replacen(&title.to_lowercase(), "", 1);
             // Ignore model-inferred optional attributes. Create uses the GUI defaults;
@@ -209,6 +226,10 @@ impl ItemOperationPolicy {
         }
         for field in ["scheduled_date", "due_date", "due_from", "due_to"] {
             if name != "list_items" && !field_policy.date_field_requested(field) {
+                args.remove(field);
+                continue;
+            }
+            if name == "create_item" && args.get(field).is_some_and(Value::is_null) {
                 args.remove(field);
                 continue;
             }
@@ -327,6 +348,9 @@ impl ItemOperationPolicy {
         field: &str,
     ) -> Result<Value, String> {
         if value.is_null() {
+            if field == "due_date" && self.request.contains("無期限") {
+                return Ok(Value::Null);
+            }
             let labels: &[&str] = if field == "scheduled_date" {
                 &["予定", "予定日", "開始", "scheduled"]
             } else {
