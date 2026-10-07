@@ -18,7 +18,7 @@ export interface ActionCandidate {
   status: ItemStatus; notes: string;
 }
 export interface PendingAction {
-  token: string; kind: 'select' | 'delete'; operation: 'update_item' | 'complete_item' | 'delete_item';
+  token: string; kind: 'select' | 'confirm' | 'delete'; operation: 'create_item' | 'update_item' | 'complete_item' | 'delete_item';
   message: string; candidates: ActionCandidate[];
 }
 export interface ConversationDetail { conversation: Conversation; messages: Message[]; pending_action?: PendingAction | null }

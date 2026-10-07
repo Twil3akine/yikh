@@ -52,10 +52,10 @@ struct PendingState {
 
 #[derive(Clone)]
 enum PendingOperation {
+    Create(ItemInput),
     Update(ItemPatch),
     Complete,
-    ChooseDelete,
-    ConfirmDelete,
+    Delete,
 }
 
 #[derive(Clone)]
@@ -138,7 +138,7 @@ impl AssistantTools {
         );
         definitions.push(function(
             "create_item",
-            "タイトルと種類が分かれば確認せず追加します。任意項目はユーザーが指定したものだけ渡してください。",
+            "追加内容を確認用に提示します。ユーザーが確認するまで追加しません。任意項目は指定されたものだけ渡してください。",
             optional(p, vec!["title"]),
         ));
 
@@ -169,7 +169,7 @@ impl AssistantTools {
         );
         definitions.push(function(
             "update_item",
-            "一意の対象は確認せず、指定項目だけを更新します。同名の場合はアプリが候補選択を表示します。",
+            "指定項目の更新内容を確認用に提示します。同名の場合は対象を選び、内容を確認してから更新します。",
             optional(p, vec!["title"]),
         ));
 
@@ -177,7 +177,7 @@ impl AssistantTools {
         p.insert("title".into(), string("完了するアイテムの現在のタイトル"));
         definitions.push(function(
             "complete_item",
-            "一意の対象は確認せず完了にします。同名の場合はアプリが候補選択を表示します。",
+            "完了する対象を確認用に提示します。同名の場合は対象を選び、確認してから完了にします。",
             optional(p, vec!["title"]),
         ));
 
@@ -288,7 +288,7 @@ impl AssistantTools {
         arguments: Value,
         targets: Option<crate::assistant_targets::TargetResolution>,
     ) -> Result<ToolResult, String> {
-        let needs_confirmation = targets
+        let needs_selection = targets
             .as_ref()
             .is_some_and(|targets| targets.needs_confirmation);
         let mut pending = self
@@ -298,39 +298,19 @@ impl AssistantTools {
         if pending.contains_key(conversation_id) {
             return Err("先に表示中の操作を選択、確認、またはキャンセルしてください".to_owned());
         }
-        match name {
-            "list_items" => list_items(service, arguments),
-            "create_item" => create_item(service, arguments),
+        let (matches, operation) = match name {
+            "list_items" => return list_items(service, arguments),
+            "create_item" => (
+                Vec::new(),
+                PendingOperation::Create(create_arguments(arguments)?),
+            ),
             "update_item" => {
                 let (title, patch) = update_arguments(arguments)?;
                 let matches = match targets {
                     Some(targets) => targets.items,
                     None => exact_title_matches(service, &title)?,
                 };
-                match matches.len() {
-                    0 => Err("該当するアイテムが見つかりません".to_owned()),
-                    1 if !needs_confirmation => update_one(service, &matches[0], patch),
-                    _ => {
-                        let message = if matches.len() == 1 {
-                            format!(
-                                "「{}」のことですか？候補を選ぶと、次の変更を適用します。\n{}",
-                                matches[0].title,
-                                patch_description(&patch)
-                            )
-                        } else {
-                            format!("どのアイテムを更新しますか？候補を選ぶと、次の変更を適用します。\n{}", patch_description(&patch))
-                        };
-                        let result = self.make_pending("select", name, &message, &matches);
-                        store_pending(
-                            &mut pending,
-                            conversation_id,
-                            &result,
-                            matches,
-                            PendingOperation::Update(patch),
-                        )?;
-                        Ok(result)
-                    }
-                }
+                (matches, PendingOperation::Update(patch))
             }
             "complete_item" | "delete_item" => {
                 let args = object(arguments, &["title"])?;
@@ -339,51 +319,31 @@ impl AssistantTools {
                     Some(targets) => targets.items,
                     None => exact_title_matches(service, &title)?,
                 };
-                match matches.len() {
-                    0 => Err("該当するアイテムが見つかりません".to_owned()),
-                    1 if name == "complete_item" && !needs_confirmation => {
-                        complete_one(service, &matches[0])
-                    }
-                    1 if name == "delete_item" => {
-                        let result = self.make_pending(
-                            "delete",
-                            name,
-                            &format!("「{}」を削除しますか？", matches[0].title),
-                            &matches,
-                        );
-                        store_pending(
-                            &mut pending,
-                            conversation_id,
-                            &result,
-                            matches,
-                            PendingOperation::ConfirmDelete,
-                        )?;
-                        Ok(result)
-                    }
-                    _ => {
-                        let op = if name == "complete_item" {
-                            PendingOperation::Complete
-                        } else {
-                            PendingOperation::ChooseDelete
-                        };
-                        let message = if name == "complete_item" && matches.len() == 1 {
-                            format!(
-                                "「{}」を完了にする依頼ですか？候補を選ぶと完了にします。",
-                                matches[0].title
-                            )
-                        } else if name == "complete_item" {
-                            "どのアイテムを完了にしますか？".into()
-                        } else {
-                            "どのアイテムを削除しますか？".into()
-                        };
-                        let result = self.make_pending("select", name, &message, &matches);
-                        store_pending(&mut pending, conversation_id, &result, matches, op)?;
-                        Ok(result)
-                    }
-                }
+                let operation = if name == "complete_item" {
+                    PendingOperation::Complete
+                } else {
+                    PendingOperation::Delete
+                };
+                (matches, operation)
             }
-            _ => Err("利用できない操作です".to_owned()),
-        }
+            _ => return Err("利用できない操作です".to_owned()),
+        };
+        let result = if matches!(operation, PendingOperation::Create(_)) {
+            self.make_confirmation(name, &operation, &matches)?
+        } else if matches.is_empty() {
+            return Err("該当するアイテムが見つかりません".to_owned());
+        } else if matches.len() == 1 && !needs_selection {
+            self.make_confirmation(name, &operation, &matches)?
+        } else {
+            self.make_pending(
+                "select",
+                name,
+                "対象のアイテムを選んでください。選択後に操作内容を確認します。",
+                &matches,
+            )
+        };
+        store_pending(&mut pending, conversation_id, &result, matches, operation)?;
+        Ok(result)
     }
 
     pub fn resolve(
@@ -411,73 +371,106 @@ impl AssistantTools {
                 state.operation.clone(),
             )
         };
-        match operation {
-            PendingOperation::ConfirmDelete => {
-                if !confirm {
-                    return Err("削除には明示的な確認が必要です".to_owned());
-                }
-                if let Some(key) = candidate_key {
-                    if !action
-                        .candidates
-                        .iter()
-                        .any(|candidate| candidate.key == key)
-                    {
-                        return Err("選択肢が無効です".to_owned());
-                    }
-                }
-                let item = candidates
-                    .first()
-                    .ok_or_else(|| "削除候補がありません".to_owned())?
-                    .clone();
-                ensure_fresh(service, &item)?;
-                service.delete(&item.id)?;
-                pending_map.remove(conversation_id);
-                Ok(success(format!("「{}」を削除しました。", item.title), None))
+        if action.kind == "select" {
+            if confirm {
+                return Err("対象を選んでから操作内容を確認してください".to_owned());
             }
-            PendingOperation::Update(_)
-            | PendingOperation::Complete
-            | PendingOperation::ChooseDelete => {
-                if confirm {
-                    return Err("この選択操作では確認フラグを使えません".to_owned());
-                }
-                let key = candidate_key.ok_or_else(|| "候補を選択してください".to_owned())?;
-                let index = action
-                    .candidates
-                    .iter()
-                    .position(|candidate| candidate.key == key)
-                    .ok_or_else(|| "選択肢が無効です".to_owned())?;
-                let item = candidates
-                    .get(index)
-                    .ok_or_else(|| "選択肢が無効です".to_owned())?
-                    .clone();
-                ensure_fresh(service, &item)?;
-                let outcome = match operation {
-                    PendingOperation::Update(input) => update_one(service, &item, input)?,
-                    PendingOperation::Complete => complete_one(service, &item)?,
-                    PendingOperation::ChooseDelete => {
-                        let items = vec![item];
-                        let result = self.make_pending(
-                            "delete",
-                            "delete_item",
-                            &format!("「{}」を削除しますか？", items[0].title),
-                            &items,
-                        );
-                        pending_map.remove(conversation_id);
-                        store_pending(
-                            &mut pending_map,
-                            conversation_id,
-                            &result,
-                            items,
-                            PendingOperation::ConfirmDelete,
-                        )?;
-                        return Ok(result);
-                    }
-                    PendingOperation::ConfirmDelete => unreachable!(),
-                };
-                pending_map.remove(conversation_id);
-                Ok(outcome)
+            let key = candidate_key.ok_or_else(|| "候補を選択してください".to_owned())?;
+            let index = action
+                .candidates
+                .iter()
+                .position(|candidate| candidate.key == key)
+                .ok_or_else(|| "選択肢が無効です".to_owned())?;
+            let item = candidates
+                .get(index)
+                .ok_or_else(|| "選択肢が無効です".to_owned())?
+                .clone();
+            ensure_fresh(service, &item)?;
+            let items = vec![item];
+            let result = self.make_confirmation(&action.operation, &operation, &items)?;
+            store_pending(&mut pending_map, conversation_id, &result, items, operation)?;
+            return Ok(result);
+        }
+        if !confirm {
+            return Err("実行には明示的な確認が必要です".to_owned());
+        }
+        if let Some(key) = candidate_key {
+            if !action
+                .candidates
+                .iter()
+                .any(|candidate| candidate.key == key)
+            {
+                return Err("選択肢が無効です".to_owned());
             }
         }
+        let result = match operation {
+            PendingOperation::Create(input) => create_one(service, input)?,
+            operation => {
+                let item = candidates
+                    .first()
+                    .ok_or_else(|| "対象がありません".to_owned())?;
+                ensure_fresh(service, item)?;
+                match operation {
+                    PendingOperation::Update(patch) => update_one(service, item, patch)?,
+                    PendingOperation::Complete => complete_one(service, item)?,
+                    PendingOperation::Delete => {
+                        service.delete(&item.id)?;
+                        success(format!("「{}」を削除しました。", item.title), None)
+                    }
+                    PendingOperation::Create(_) => unreachable!(),
+                }
+            }
+        };
+        pending_map.remove(conversation_id);
+        Ok(result)
+    }
+
+    fn make_confirmation(
+        &self,
+        name: &str,
+        operation: &PendingOperation,
+        items: &[Item],
+    ) -> Result<ToolResult, String> {
+        let message = match operation {
+            PendingOperation::Create(input) => format!(
+                "次の内容で追加してよいですか？\n{}",
+                patch_description(&ItemPatch {
+                    title: Some(input.title.clone()),
+                    kind: Some(input.kind),
+                    notes: Some(if input.notes.is_empty() {
+                        "未設定".into()
+                    } else {
+                        input.notes.clone()
+                    }),
+                    project: Some(input.project.clone()),
+                    scheduled_date: Some(input.scheduled_date.clone()),
+                    due_date: Some(input.due_date.clone()),
+                    priority: Some(input.priority),
+                    tags: Some(input.tags.clone()),
+                })
+            ),
+            operation => {
+                let item = items.first().ok_or_else(|| "対象がありません".to_owned())?;
+                match operation {
+                    PendingOperation::Update(patch) => format!(
+                        "「{}」を次の内容で更新してよいですか？\n{}",
+                        item.title,
+                        patch_description(patch)
+                    ),
+                    PendingOperation::Complete => {
+                        format!("「{}」を完了にしてよいですか？", item.title)
+                    }
+                    PendingOperation::Delete => format!("「{}」を削除しますか？", item.title),
+                    PendingOperation::Create(_) => unreachable!(),
+                }
+            }
+        };
+        let kind = if matches!(operation, PendingOperation::Delete) {
+            "delete"
+        } else {
+            "confirm"
+        };
+        Ok(self.make_pending(kind, name, &message, items))
     }
 
     pub fn cancel(&self, conversation_id: &str, token: &str) -> Result<(), String> {
@@ -649,7 +642,7 @@ fn list_items(service: &ItemService, arguments: Value) -> Result<ToolResult, Str
     })
 }
 
-fn create_item(service: &ItemService, arguments: Value) -> Result<ToolResult, String> {
+fn create_arguments(arguments: Value) -> Result<ItemInput, String> {
     let args = object(
         arguments,
         &[
@@ -673,6 +666,10 @@ fn create_item(service: &ItemService, arguments: Value) -> Result<ToolResult, St
         priority: optional_enum(&args, "priority")?.unwrap_or(Priority::None),
         tags: optional_strings(&args, "tags")?.unwrap_or_default(),
     };
+    Ok(input)
+}
+
+fn create_one(service: &ItemService, input: ItemInput) -> Result<ToolResult, String> {
     let item = service.create(input)?;
     let mut message = format!("「{}」を追加しました。", item.title);
     match (&item.scheduled_date, &item.due_date) {
@@ -961,6 +958,31 @@ mod tests {
         json!({"kind":"task","title":title,"notes":"keep me","project":"Studio","scheduled_date":"2026-10-08","due_date":"2026-10-12","priority":"high","tags":["ship"]})
     }
 
+    fn approve(
+        tools: &AssistantTools,
+        service: &ItemService,
+        id: &str,
+        proposal: ToolResult,
+    ) -> ToolResult {
+        assert!(!proposal.changed);
+        let pending = proposal.pending.unwrap();
+        assert!(matches!(pending.kind.as_str(), "confirm" | "delete"));
+        assert!(tools
+            .resolve(service, id, &pending.token, None, false)
+            .is_err());
+        assert!(tools
+            .resolve(service, "other-conversation", &pending.token, None, true)
+            .is_err());
+        let result = tools
+            .resolve(service, id, &pending.token, None, true)
+            .unwrap();
+        assert!(result.changed && result.pending.is_none());
+        assert!(tools
+            .resolve(service, id, &pending.token, None, true)
+            .is_err());
+        result
+    }
+
     fn with_sources(request: &str, reference: &str, mut args: Value, fields: &[&str]) -> Value {
         let object = args.as_object_mut().unwrap();
         let changes: Vec<_> = fields
@@ -983,9 +1005,7 @@ mod tests {
             let (_directory, service) = service();
             let tools = AssistantTools::default();
             for title in ["Aufyの開発", "Aufyの検証"] {
-                tools
-                    .execute_validated(&service, "c", "create_item", create_args(title))
-                    .unwrap();
+                create_one(&service, create_arguments(create_args(title)).unwrap()).unwrap();
             }
             let policy = ItemOperationPolicy::new(
                 "Aufyを操作して",
@@ -1033,6 +1053,13 @@ mod tests {
                 assert_eq!(remaining.len(), 1);
                 assert_ne!(remaining[0].title, selected.title);
             } else {
+                assert!(!result.changed);
+                assert!(service
+                    .query(&ItemQuery::default())
+                    .unwrap()
+                    .iter()
+                    .all(|item| item.status == ItemStatus::Active));
+                let result = approve(&tools, &service, "c", result);
                 assert!(result.changed && result.pending.is_none());
                 let items = service.query(&ItemQuery::default()).unwrap();
                 assert_eq!(
@@ -1055,7 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_executes_clear_requests_without_confirming_or_inventing_attributes() {
+    fn all_writes_require_confirmation_without_inventing_attributes() {
         let (_directory, service) = service();
         let tools = AssistantTools::default();
         let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
@@ -1068,6 +1095,10 @@ mod tests {
             "title":"OSS課題レポート","kind":"task",
             "scheduled_date":{"relative":"today"}, "due_date":{"relative":"days_after","days":7}
             }), &["kind", "scheduled_date", "due_date"]), &policy).unwrap();
+        assert!(!added.changed);
+        assert_eq!(added.pending.as_ref().unwrap().operation, "create_item");
+        assert!(added.pending.as_ref().unwrap().candidates.is_empty());
+        let added = approve(&tools, &service, "c", added);
         assert!(added.changed && added.pending.is_none());
         let item = service.query(&ItemQuery::default()).unwrap().remove(0);
         assert_eq!(item.scheduled_date.as_deref(), Some("2026-10-07"));
@@ -1089,6 +1120,13 @@ mod tests {
                 &policy,
             )
             .unwrap();
+        assert_eq!(
+            service.query(&ItemQuery::default()).unwrap()[0]
+                .due_date
+                .as_deref(),
+            Some("2026-10-14")
+        );
+        let updated = approve(&tools, &service, "c", updated);
         assert!(updated.changed && updated.pending.is_none());
         assert_eq!(updated.output["item"]["scheduled_date"], "2026-10-07");
         assert_eq!(updated.output["item"]["due_date"], "2026-10-16");
@@ -1109,6 +1147,11 @@ mod tests {
                 &policy,
             )
             .unwrap();
+        assert_eq!(
+            service.query(&ItemQuery::default()).unwrap()[0].status,
+            ItemStatus::Active
+        );
+        let completed = approve(&tools, &service, "c", completed);
         assert!(completed.changed && completed.pending.is_none());
         assert_eq!(completed.output["item"]["status"], "completed");
 
@@ -1149,7 +1192,8 @@ mod tests {
             "OSS課題レポートが今日開始の一週間後締め切りでタスク追加してもらえるかな",
             today,
         );
-        tools.execute(&service, "c", "create_item", with_sources(create_policy.request(), "OSS課題レポート", json!({"title":"OSS課題レポート","kind":"task","scheduled_date":{"relative":"today"},"due_date":{"relative":"days_after","days":7}}), &["kind", "scheduled_date", "due_date"]), &create_policy).unwrap();
+        let proposal = tools.execute(&service, "c", "create_item", with_sources(create_policy.request(), "OSS課題レポート", json!({"title":"OSS課題レポート","kind":"task","scheduled_date":{"relative":"today"},"due_date":{"relative":"days_after","days":7}}), &["kind", "scheduled_date", "due_date"]), &create_policy).unwrap();
+        approve(&tools, &service, "c", proposal);
         let completion_policy = ItemOperationPolicy::new("OSSのレポートできた", today);
         let completion = tools
             .execute(
@@ -1165,6 +1209,11 @@ mod tests {
                 &completion_policy,
             )
             .unwrap();
+        assert_eq!(
+            service.query(&ItemQuery::default()).unwrap()[0].status,
+            ItemStatus::Active
+        );
+        let completion = approve(&tools, &service, "c", completion);
         assert!(completion.changed && completion.pending.is_none());
         let completed = service.query(&ItemQuery::default()).unwrap().remove(0);
         assert_eq!(completed.status, ItemStatus::Completed);
@@ -1186,6 +1235,10 @@ mod tests {
                 &bute_policy,
             )
             .unwrap();
+        assert!(!added.changed);
+        assert_eq!(added.pending.as_ref().unwrap().operation, "create_item");
+        assert!(added.pending.as_ref().unwrap().candidates.is_empty());
+        let added = approve(&tools, &service, "c", added);
         assert!(added.changed && added.pending.is_none());
         assert!(!added.output["message"]
             .as_str()
@@ -1213,14 +1266,11 @@ mod tests {
         assert_eq!(completed.status, ItemStatus::Completed);
 
         // A model-proposed full title must not bypass ambiguity in the user's alias.
-        tools
-            .execute_validated(
-                &reopened,
-                "c",
-                "create_item",
-                create_args("OSS研究レポート"),
-            )
-            .unwrap();
+        create_one(
+            &reopened,
+            create_arguments(create_args("OSS研究レポート")).unwrap(),
+        )
+        .unwrap();
         let pending = tools
             .execute(
                 &reopened,
@@ -1253,9 +1303,11 @@ mod tests {
     fn dispatch_create_patch_preserves_omitted_fields_complete_and_exact_filters() {
         let (_directory, service) = service();
         let tools = AssistantTools::default();
-        let created = tools
+        let proposal = tools
             .execute_validated(&service, "c1", "create_item", create_args("Release"))
             .unwrap();
+        assert!(service.query(&ItemQuery::default()).unwrap().is_empty());
+        let created = approve(&tools, &service, "c1", proposal);
         assert!(created.changed);
         let filtered = tools
             .execute_validated(
@@ -1276,6 +1328,11 @@ mod tests {
                 json!({"title":"Release","notes":"updated"}),
             )
             .unwrap();
+        assert_eq!(
+            service.query(&ItemQuery::default()).unwrap()[0].notes,
+            "keep me"
+        );
+        let updated = approve(&tools, &service, "c1", updated);
         assert_eq!(updated.output["item"]["notes"], "updated");
         assert_eq!(updated.output["item"]["project"], "Studio");
         assert_eq!(updated.output["item"]["scheduled_date"], "2026-10-08");
@@ -1291,21 +1348,89 @@ mod tests {
                 json!({"title":"Release","scheduled_date":null}),
             )
             .unwrap();
+        let cleared = approve(&tools, &service, "c1", cleared);
         assert!(cleared.output["item"]["scheduled_date"].is_null());
         assert_eq!(cleared.output["item"]["due_date"], "2026-10-12");
         let completed = tools
             .execute_validated(&service, "c1", "complete_item", json!({"title":"Release"}))
             .unwrap();
+        let completed = approve(&tools, &service, "c1", completed);
         assert_eq!(completed.output["item"]["status"], "completed");
     }
 
     #[test]
-    fn delete_is_scoped_confirmed_once_and_rejects_stale_snapshot() {
+    fn cancelled_or_cleared_confirmations_never_execute_any_write() {
+        for (name, arguments) in [
+            ("create_item", create_args("New")),
+            ("update_item", json!({"title":"Existing","notes":"changed"})),
+            ("complete_item", json!({"title":"Existing"})),
+            ("delete_item", json!({"title":"Existing"})),
+        ] {
+            let (_directory, service) = service();
+            let tools = AssistantTools::default();
+            create_one(&service, create_arguments(create_args("Existing")).unwrap()).unwrap();
+            let before =
+                serde_json::to_value(service.query(&ItemQuery::default()).unwrap()).unwrap();
+            for clear in [false, true] {
+                let proposal = tools
+                    .execute_validated(&service, "c", name, arguments.clone())
+                    .unwrap();
+                let pending = proposal.pending.unwrap();
+                assert!(!proposal.changed);
+                assert!(tools
+                    .resolve(&service, "c", &pending.token, None, false)
+                    .is_err());
+                if clear {
+                    tools.clear("c").unwrap();
+                } else {
+                    tools.cancel("c", &pending.token).unwrap();
+                }
+                assert!(tools
+                    .resolve(&service, "c", &pending.token, None, true)
+                    .is_err());
+                assert_eq!(
+                    serde_json::to_value(service.query(&ItemQuery::default()).unwrap()).unwrap(),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn confirmations_are_scoped_single_use_and_reject_stale_snapshots() {
         let (_directory, service) = service();
         let tools = AssistantTools::default();
-        tools
-            .execute_validated(&service, "a", "create_item", create_args("Delete me"))
+        create_one(
+            &service,
+            create_arguments(create_args("Delete me")).unwrap(),
+        )
+        .unwrap();
+        for (name, args) in [
+            (
+                "update_item",
+                json!({"title":"Delete me","notes":"assistant value"}),
+            ),
+            ("complete_item", json!({"title":"Delete me"})),
+        ] {
+            let pending = tools
+                .execute_validated(&service, "a", name, args)
+                .unwrap()
+                .pending
+                .unwrap();
+            let item = service.query(&ItemQuery::default()).unwrap().remove(0);
+            let (_, patch) = update_arguments(
+                json!({"title":"Delete me","notes":format!("GUI change: {name}")}),
+            )
             .unwrap();
+            update_one(&service, &item, patch).unwrap();
+            assert!(tools
+                .resolve(&service, "a", &pending.token, None, true)
+                .is_err());
+            let unchanged = service.query(&ItemQuery::default()).unwrap().remove(0);
+            assert_eq!(unchanged.notes, format!("GUI change: {name}"));
+            assert_eq!(unchanged.status, ItemStatus::Active);
+            tools.cancel("a", &pending.token).unwrap();
+        }
         let pending = tools
             .execute_validated(&service, "a", "delete_item", json!({"title":"Delete me"}))
             .unwrap()
@@ -1368,15 +1493,11 @@ mod tests {
     fn duplicate_titles_always_require_choice_then_delete_confirmation() {
         let (_directory, service) = service();
         let tools = AssistantTools::default();
-        tools
-            .execute_validated(&service, "a", "create_item", create_args("Same"))
-            .unwrap();
+        create_one(&service, create_arguments(create_args("Same")).unwrap()).unwrap();
         let mut other = create_args("Same");
         other["kind"] = json!("bute");
         other["project"] = json!("Other");
-        tools
-            .execute_validated(&service, "a", "create_item", other)
-            .unwrap();
+        create_one(&service, create_arguments(other).unwrap()).unwrap();
 
         for (name, args) in [
             ("update_item", json!({"title":"Same","notes":"chosen only"})),
@@ -1401,6 +1522,15 @@ mod tests {
                     false,
                 )
                 .unwrap();
+            assert!(!selected.changed);
+            assert!(tools
+                .resolve(&service, "a", &pending.token, None, true)
+                .is_err());
+            let unchanged = service.query(&ItemQuery::default()).unwrap();
+            assert!(unchanged
+                .iter()
+                .all(|item| item.status == ItemStatus::Active && item.notes == "keep me"));
+            let selected = approve(&tools, &service, "a", selected);
             assert!(selected.changed);
             let items = service.query(&ItemQuery::default()).unwrap();
             if name == "update_item" {

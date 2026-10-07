@@ -18,10 +18,11 @@
   let historyOpen = $state(false);
   let confirmDelete = $state(false);
   const composition = createCompositionGuard();
-  const candidateActionLabels = {
-    update_item: 'このアイテムを更新',
-    complete_item: 'このアイテムを完了にする',
-    delete_item: 'このアイテムの削除を確認',
+  const finalActionLabels = {
+    create_item: 'この内容で追加',
+    update_item: 'この内容で更新',
+    complete_item: '完了にする',
+    delete_item: 'このアイテムを削除',
   };
 
   $effect(() => { if (active && focusToken > 0) void tick().then(() => input?.focus()); });
@@ -234,7 +235,7 @@
     {#if current}
       {#each current.messages as message (message.id)}
         <article class:user={message.role === 'user'}>
-          {#if message.role === 'user'}
+          {#if message.role === 'user' || message.content === current.pending_action?.message}
             <p>{message.content}</p>
           {:else}
             <!-- Markdown anchors already provide keyboard activation through click. -->
@@ -252,8 +253,8 @@
               <span class="candidate-title">{candidate.title}</span>
               <small>{candidate.kind === 'task' ? 'Task' : 'Bute'}{candidate.status === 'completed' ? '（完了済み）' : ''} / {candidate.project ?? 'プロジェクト未設定'} / 締切 {candidate.due_date ?? '未設定'}{#if candidate.scheduled_date} / 予定 {candidate.scheduled_date}{/if}</small>
               {#if candidate.notes}<small class="candidate-notes">{candidate.notes}</small>{/if}
-              <button class="primary candidate-action" disabled={busy} aria-label={`${candidate.title}: ${candidateActionLabels[current.pending_action.operation]}`} onclick={() => resolveItemAction(candidate.key, false)}>
-                {candidateActionLabels[current.pending_action.operation]}
+              <button class="primary candidate-action" disabled={busy} aria-label={`${candidate.title}: 選択して内容確認へ進む`} onclick={() => resolveItemAction(candidate.key, false)}>
+                選択して内容確認へ進む
               </button>
             </div>
           {:else}
@@ -261,7 +262,9 @@
           {/if}
         {/each}
         <div class="confirmation-actions">
-          {#if current.pending_action.kind === 'delete'}<button class="danger" disabled={busy} onclick={() => resolveItemAction(null, true)}>このアイテムを削除</button>{/if}
+          {#if current.pending_action.kind === 'confirm' || current.pending_action.kind === 'delete'}
+            <button class:danger={current.pending_action.operation === 'delete_item'} class:primary={current.pending_action.operation !== 'delete_item'} disabled={busy} onclick={() => resolveItemAction(null, true)}>{finalActionLabels[current.pending_action.operation]}</button>
+          {/if}
           <button disabled={busy} onclick={cancelItemAction}>キャンセル</button>
         </div>
       </section>
@@ -319,7 +322,7 @@
   .item-confirmation small { display: block; color: #7c858c; font-size: 11px; line-height: 1.6; }
   .item-confirmation .candidate-notes { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
   .confirmation-target { margin: 0 0 4px; }
-  .confirmation-actions { display: flex; gap: 6px; }
+  .confirmation-actions { display: flex; flex-wrap: wrap; gap: 6px; }
   .compose { min-width: 0; padding: 14px; border-top: 1px solid #e8eaec; }
   .compose form { min-width: 0; }
   .compose textarea { width: 100%; min-width: 0; box-sizing: border-box; resize: vertical; max-height: 160px; }
