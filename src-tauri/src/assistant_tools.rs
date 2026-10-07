@@ -198,17 +198,13 @@ impl AssistantTools {
                 });
             }
             properties.insert(
-                "instruction".into(),
-                string("今回の発言で操作を依頼した箇所をそのまま引用します"),
-            );
-            properties.insert(
                 "reference".into(),
-                string("今回の発言と対象タイトルに含まれる名前の部分をそのまま引用します"),
+                string("今回の依頼原文と対象タイトルの両方に含まれる名前の部分を原文のまま引用します。正式タイトルへ補完しません"),
             );
             definition["function"]["parameters"]["required"]
                 .as_array_mut()
                 .unwrap()
-                .extend([json!("instruction"), json!("reference")]);
+                .push(json!("reference"));
         }
 
         json!(definitions)
@@ -870,7 +866,6 @@ mod tests {
             let value = object.remove(*field).unwrap();
             object.insert((*field).into(), json!({"value":value,"source":request}));
         }
-        object.insert("instruction".into(), json!(request));
         object.insert("reference".into(), json!(reference));
         args
     }

@@ -49,14 +49,14 @@ impl ItemOperationPolicy {
             .cloned()
             .ok_or("Toolの引数はオブジェクトで指定してください。")?;
         if name != "list_items" {
-            for key in ["instruction", "reference"] {
-                let source = args
-                    .remove(key)
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .ok_or("操作と対象を、今回のユーザー発言から引用してください。")?;
-                if !self.contains_source(&source) {
-                    return Err("操作の根拠が今回のユーザー発言にありません。".into());
-                }
+            // The application already binds this policy to the current request.
+            // Asking the model to restate that instruction adds no intent check.
+            let reference = args
+                .remove("reference")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or("対象名を依頼文から引用してください。")?;
+            if !self.contains_source(&reference) {
+                return Err("Assistantが対象名を依頼文から正しく読み取れませんでした。Itemは変更していません。".into());
             }
             // Each supplied field carries its own value and evidence. Reject
             // incomplete arguments instead of silently dropping requested changes.
@@ -178,7 +178,7 @@ mod tests {
             ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
         let raw = json!({"title":"Aufyの開発",
             "project":{"value":"Automation","source":"プロジェクトをAutomationにして"},
-            "instruction":request, "reference":"Aufy"});
+            "reference":"Aufy"});
         let args = policy.validate("update_item", raw.clone()).unwrap();
         assert_eq!(args, json!({"title":"Aufyの開発","project":"Automation"}));
         for invalid in [
@@ -191,6 +191,9 @@ mod tests {
             incomplete["project"] = invalid;
             assert!(policy.validate("update_item", incomplete).is_err());
         }
+        let mut from_snapshot = raw.clone();
+        from_snapshot["reference"] = json!("Aufyの開発");
+        assert!(policy.validate("update_item", from_snapshot).is_err());
         let mut empty_update = raw;
         empty_update.as_object_mut().unwrap().remove("project");
         let error = policy.validate("update_item", empty_update).unwrap_err();
@@ -207,7 +210,7 @@ mod tests {
             "kind":{"value":"bute","source":"butes"},
             "priority":{"value":"low","source":"低めの優先度"},
             "notes":{"value":"https://github.com/twil3akine/gwitg","source":"メモにはgithubのtwil3akineのgwitgのURLを保存して"},
-            "instruction":request,"reference":"Aufyの開発"});
+            "reference":"Aufyの開発"});
         let args = policy.validate("create_item", raw.clone()).unwrap();
         assert_eq!(args["kind"], "bute");
         assert_eq!(args["priority"], "low");
@@ -222,7 +225,7 @@ mod tests {
             .validate(
                 "create_item",
                 json!({"title":"Aufyの開発",
-            "instruction":request,"reference":"Aufyの開発"}),
+            "reference":"Aufyの開発"}),
             )
             .unwrap();
         assert_eq!(args["kind"], "task");
@@ -237,7 +240,7 @@ mod tests {
         let mut raw = json!({"title":"レポート",
             "scheduled_date":{"value":{"relative":"today"},"source":"今日開始"},
             "due_date":{"value":{"relative":"days_after","days":7},"source":"一週間後締切"},
-            "instruction":request,"reference":"レポート"});
+            "reference":"レポート"});
         let args = policy.validate("create_item", raw.clone()).unwrap();
         assert_eq!(args["scheduled_date"], "2026-12-30");
         assert_eq!(args["due_date"], "2027-01-06");
