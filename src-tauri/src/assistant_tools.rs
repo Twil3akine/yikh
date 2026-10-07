@@ -1,4 +1,5 @@
-use crate::assistant_policy::{date_schema, ItemOperationPolicy, ValidationError};
+use crate::assistant_dates::date_schema;
+use crate::assistant_policy::{ItemOperationPolicy, ValidationError};
 use crate::items::ItemService;
 use crate::model::{Item, ItemInput, ItemKind, ItemQuery, ItemStatus, Priority};
 use chrono::NaiveDate;
@@ -195,21 +196,32 @@ impl AssistantTools {
             let properties = definition["function"]["parameters"]["properties"]
                 .as_object_mut()
                 .unwrap();
-            for (field, schema) in properties.iter_mut() {
-                if field == "title" {
-                    continue;
-                }
-                *schema = json!({
-                    "type":"object",
-                    "description":"今回指定された項目だけ、値と根拠の引用を一組で渡します",
-                    "properties":{
-                        "value":schema.clone(),
+            if let Some(title) = properties.remove("title") {
+                let variants: Vec<_> = std::mem::take(properties)
+                    .into_iter()
+                    .map(|(field, schema)| {
+                        json!({"type":"object","properties":{
+                        "field":{"type":"string","enum":[field]},
+                        "value":schema,
                         "source":string("今回の発言でこの項目を指定した箇所をそのまま引用します")
-                    },
-                    "required":["value","source"],
-                    "additionalProperties":false
-                });
+                    },"required":["field","value","source"],"additionalProperties":false})
+                    })
+                    .collect();
+                properties.insert("title".into(), title);
+                if !variants.is_empty() {
+                    properties.insert("changes".into(), json!({
+                        "type":"array","description":"今回指定された属性をすべて、一度ずつ列挙します。未指定属性は追加しません",
+                        "items":{"oneOf":variants},"maxItems":variants.len()
+                    }));
+                    definition["function"]["parameters"]["required"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("changes"));
+                }
             }
+            let properties = definition["function"]["parameters"]["properties"]
+                .as_object_mut()
+                .unwrap();
             properties.insert(
                 "reference".into(),
                 string("今回の依頼原文と対象タイトルの両方に含まれる名前の部分を原文のまま引用します。正式タイトルへ補完しません"),
@@ -951,9 +963,15 @@ mod tests {
 
     fn with_sources(request: &str, reference: &str, mut args: Value, fields: &[&str]) -> Value {
         let object = args.as_object_mut().unwrap();
-        for field in fields {
-            let value = object.remove(*field).unwrap();
-            object.insert((*field).into(), json!({"value":value,"source":request}));
+        let changes: Vec<_> = fields
+            .iter()
+            .map(|field| {
+                let value = object.remove(*field).unwrap();
+                json!({"field":field,"value":value,"source":request})
+            })
+            .collect();
+        if !fields.is_empty() {
+            object.insert("changes".into(), json!(changes));
         }
         object.insert("reference".into(), json!(reference));
         args

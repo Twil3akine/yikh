@@ -1,17 +1,7 @@
-use chrono::{Datelike, Duration, NaiveDate};
-use serde::Deserialize;
+use crate::assistant_dates::resolve_date;
+use crate::assistant_routing::{ItemPlan, FIELDS as MUTABLE_FIELDS};
+use chrono::NaiveDate;
 use serde_json::{json, Value};
-
-const MUTABLE_FIELDS: &[&str] = &[
-    "kind",
-    "new_title",
-    "priority",
-    "project",
-    "tags",
-    "notes",
-    "scheduled_date",
-    "due_date",
-];
 
 /// The model interprets the request; Rust validates its structured arguments.
 /// Evidence must come from this request, never from Item data or conversation history.
@@ -73,6 +63,21 @@ impl ItemOperationPolicy {
         ) {
             return Err("利用できない操作です。".into());
         }
+        let arguments = if matches!(name, "create_item" | "update_item") {
+            let plan = ItemPlan::parse(arguments)?;
+            let mut args = serde_json::Map::new();
+            args.insert("title".into(), json!(plan.title));
+            args.insert("reference".into(), json!(plan.reference));
+            for change in plan.changes {
+                args.insert(
+                    change.field,
+                    json!({"value":change.value,"source":change.source}),
+                );
+            }
+            Value::Object(args)
+        } else {
+            arguments
+        };
         let mut args = arguments
             .as_object()
             .cloned()
@@ -142,32 +147,13 @@ impl ItemOperationPolicy {
                 continue;
             }
             if let Some(value) = args.get(field) {
-                args.insert(field.into(), self.resolve_date(value)?);
+                args.insert(field.into(), resolve_date(self.today, value)?);
             }
         }
         Ok(ValidatedOperation {
             arguments: Value::Object(args),
             reference,
         })
-    }
-
-    fn resolve_date(&self, value: &Value) -> Result<Value, String> {
-        if value.is_null() {
-            return Ok(Value::Null);
-        }
-        let date = if let Some(value) = value.as_str() {
-            let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                .map_err(|_| "日付はYYYY-MM-DDまたは相対日付で指定してください。")?;
-            if date.format("%Y-%m-%d").to_string() != value {
-                return Err("日付はYYYY-MM-DDで指定してください。".into());
-            }
-            date
-        } else {
-            let relative: RelativeDate = serde_json::from_value(value.clone())
-                .map_err(|_| "相対日付の形式が正しくありません。")?;
-            relative.resolve(self.today)?
-        };
-        Ok(json!(date.format("%Y-%m-%d").to_string()))
     }
 }
 
@@ -185,79 +171,55 @@ fn field_label(field: &str) -> &str {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "relative", rename_all = "snake_case", deny_unknown_fields)]
-enum RelativeDate {
-    Today,
-    Tomorrow,
-    DayAfterTomorrow,
-    DaysAfter { days: u32 },
-    NextWeek,
-}
-
-impl RelativeDate {
-    fn resolve(&self, today: NaiveDate) -> Result<NaiveDate, String> {
-        let days = match self {
-            Self::Today => 0,
-            Self::Tomorrow => 1,
-            Self::DayAfterTomorrow => 2,
-            Self::DaysAfter { days } => i64::from(*days),
-            Self::NextWeek => 7 - i64::from(today.weekday().num_days_from_monday()),
-        };
-        today
-            .checked_add_signed(Duration::days(days))
-            .ok_or("指定された日付が範囲外です。".into())
-    }
-}
-
-pub(crate) fn date_schema(nullable: bool) -> Value {
-    let mut variants = vec![
-        json!({"type":"string","description":"明示された日付 YYYY-MM-DD"}),
-        json!({"type":"object","properties":{"relative":{"type":"string","enum":["today","tomorrow","day_after_tomorrow","next_week"]}},"required":["relative"],"additionalProperties":false}),
-        json!({"type":"object","properties":{"relative":{"type":"string","enum":["days_after"]},"days":{"type":"integer","minimum":0}},"required":["relative","days"],"additionalProperties":false}),
-    ];
-    if nullable {
-        variants.push(json!({"type":"null"}));
-    }
-    json!({"oneOf":variants,"description":"相対日付はRustが現在日から解決します。next_weekは次の月曜日。days_afterの7は一週間後です。"})
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn paired_attributes_preserve_requested_values_and_reject_incomplete_evidence() {
-        let request = "AufyのプロジェクトをAutomationにしてもらえるかな";
-        let policy =
-            ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
-        let raw = json!({"title":"Aufyの開発",
-            "project":{"value":"Automation","source":"プロジェクトをAutomationにして"},
-            "reference":"Aufy"});
-        let args = policy
-            .validate("update_item", raw.clone())
-            .unwrap()
-            .arguments;
-        assert_eq!(args, json!({"title":"Aufyの開発","project":"Automation"}));
+    fn plans_preserve_values_and_reject_incomplete_or_invented_evidence() {
+        let policy = ItemOperationPolicy::new(
+            "AufyのプロジェクトをAutomationにして",
+            NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(),
+        );
+        let raw = json!({"title":"Aufyの開発","reference":"Aufy","changes":[
+            {"field":"project","value":"Automation","source":"プロジェクトをAutomationにして"}
+        ]});
+        assert_eq!(
+            policy
+                .validate("update_item", raw.clone())
+                .unwrap()
+                .arguments,
+            json!({"title":"Aufyの開発","project":"Automation"})
+        );
         for invalid in [
-            json!({"value":"Automation"}),
-            json!({"source":"プロジェクトをAutomationにして"}),
-            json!({"value":"Automation","source":"以前の会話にある指定"}),
-            json!("Automation"),
+            json!({"field":"project","value":"Automation"}),
+            json!({"field":"project","source":"プロジェクトをAutomationにして"}),
+            json!({"field":"project","value":"Automation","source":"以前の会話"}),
+            json!({"field":"external","value":"Automation","source":"Aufy"}),
         ] {
             let mut incomplete = raw.clone();
-            incomplete["project"] = invalid;
+            incomplete["changes"][0] = invalid;
             assert!(policy.validate("update_item", incomplete).is_err());
         }
+        let mut duplicate = raw.clone();
+        duplicate["changes"]
+            .as_array_mut()
+            .unwrap()
+            .push(raw["changes"][0].clone());
+        assert!(policy.validate("update_item", duplicate).is_err());
         let mut from_snapshot = raw.clone();
         from_snapshot["reference"] = json!("Aufyの開発");
-        let validated = policy.validate("update_item", from_snapshot).unwrap();
-        assert!(validated.reference.is_none());
-        assert_eq!(validated.arguments["project"], "Automation");
-        let mut empty_update = raw;
-        empty_update.as_object_mut().unwrap().remove("project");
-        let error = policy.validate("update_item", empty_update).unwrap_err();
-        assert!(matches!(error, ValidationError::Clarification(_)));
+        assert!(policy
+            .validate("update_item", from_snapshot)
+            .unwrap()
+            .reference
+            .is_none());
+        let mut empty = raw;
+        empty["changes"] = json!([]);
+        assert!(matches!(
+            policy.validate("update_item", empty),
+            Err(ValidationError::Clarification(_))
+        ));
         assert!(policy.validate("external_tool", json!({})).is_err());
     }
 
@@ -266,11 +228,11 @@ mod tests {
         let request = "butesにAufyの開発を入れて。低めの優先度で、メモにはgithubのtwil3akineのgwitgのURLを保存して";
         let policy =
             ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
-        let raw = json!({"title":"Aufyの開発",
-            "kind":{"value":"bute","source":"butes"},
-            "priority":{"value":"low","source":"低めの優先度"},
-            "notes":{"value":"https://github.com/twil3akine/gwitg","source":"メモにはgithubのtwil3akineのgwitgのURLを保存して"},
-            "reference":"Aufyの開発"});
+        let raw = json!({"title":"Aufyの開発","reference":"Aufyの開発","changes":[
+            {"field":"kind","value":"bute","source":"butes"},
+            {"field":"priority","value":"low","source":"低めの優先度"},
+            {"field":"notes","value":"https://github.com/twil3akine/gwitg","source":"メモにはgithubのtwil3akineのgwitgのURLを保存して"}
+        ]});
         let args = policy
             .validate("create_item", raw.clone())
             .unwrap()
@@ -281,14 +243,14 @@ mod tests {
         assert!(args.get("project").is_none() && args.get("tags").is_none());
         for field in ["priority", "project", "tags", "notes"] {
             let mut guessed = raw.clone();
-            guessed[field] = json!({"value":"他Itemから推測","source":"以前の会話"});
+            guessed["changes"] =
+                json!([{ "field":field,"value":"他Itemから推測","source":"以前の会話" }]);
             assert!(policy.validate("create_item", guessed).is_err());
         }
         let args = policy
             .validate(
                 "create_item",
-                json!({"title":"Aufyの開発",
-            "reference":"Aufyの開発"}),
+                json!({"title":"Aufyの開発","reference":"Aufyの開発","changes":[]}),
             )
             .unwrap()
             .arguments;
@@ -298,13 +260,14 @@ mod tests {
 
     #[test]
     fn relative_dates_resolve_across_year_boundary_and_invalid_dates_are_rejected() {
-        let request = "レポートを今日開始、一週間後締切で追加して";
-        let policy =
-            ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 12, 30).unwrap());
-        let mut raw = json!({"title":"レポート",
-            "scheduled_date":{"value":{"relative":"today"},"source":"今日開始"},
-            "due_date":{"value":{"relative":"days_after","days":7},"source":"一週間後締切"},
-            "reference":"レポート"});
+        let policy = ItemOperationPolicy::new(
+            "レポートを今日開始、一週間後締切で追加して",
+            NaiveDate::from_ymd_opt(2026, 12, 30).unwrap(),
+        );
+        let mut raw = json!({"title":"レポート","reference":"レポート","changes":[
+            {"field":"scheduled_date","value":{"relative":"today"},"source":"今日開始"},
+            {"field":"due_date","value":{"relative":"weeks_after","weeks":1},"source":"一週間後締切"}
+        ]});
         let args = policy
             .validate("create_item", raw.clone())
             .unwrap()
@@ -316,18 +279,12 @@ mod tests {
             json!({"relative":"unknown"}),
             json!({"relative":"days_after","days":u32::MAX}),
         ] {
-            raw["due_date"]["value"] = invalid;
+            raw["changes"][1]["value"] = invalid;
             assert!(policy.validate("create_item", raw.clone()).is_err());
         }
-        for (relative, expected) in [
-            (RelativeDate::Tomorrow, "2026-12-31"),
-            (RelativeDate::DayAfterTomorrow, "2027-01-01"),
-            (RelativeDate::NextWeek, "2027-01-04"),
-        ] {
-            assert_eq!(
-                relative.resolve(policy.today).unwrap().to_string(),
-                expected
-            );
-        }
+        assert_eq!(
+            resolve_date(policy.today, &json!({"relative":"next_week"})).unwrap(),
+            "2027-01-04"
+        );
     }
 }

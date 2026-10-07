@@ -1,4 +1,5 @@
 mod assistant;
+mod assistant_dates;
 mod assistant_policy;
 mod assistant_routing;
 mod assistant_targets;
