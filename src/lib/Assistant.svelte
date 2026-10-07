@@ -24,6 +24,20 @@
     complete_item: '完了にする',
     delete_item: 'このアイテムを削除',
   };
+  const actionPreviewLabels = {
+    create_item: '追加するアイテム',
+    update_item: '更新する内容',
+    complete_item: '完了にするアイテム',
+    delete_item: '削除するアイテム',
+  };
+
+  function changeTitle(changes: { label: string; after: string }[]) {
+    return changes.find((change) => change.label === 'タイトル')?.after ?? '新しいアイテム';
+  }
+
+  function itemKindLabel(kind: 'task' | 'bute') {
+    return kind === 'task' ? 'Task' : 'Bute';
+  }
 
   $effect(() => { if (active && focusToken > 0) void tick().then(() => input?.focus()); });
 
@@ -247,20 +261,49 @@
     {/if}
     {#if current?.pending_action}
       <section class="item-confirmation" aria-label="アイテム操作の確認">
-        {#each current.pending_action.candidates as candidate (candidate.key)}
-          {#if current.pending_action.kind === 'select'}
-            <div class="candidate">
-              <span class="candidate-title">{candidate.title}</span>
-              <small>{candidate.kind === 'task' ? 'Task' : 'Bute'}{candidate.status === 'completed' ? '（完了済み）' : ''} / {candidate.project ?? 'プロジェクト未設定'} / 締切 {candidate.due_date ?? '未設定'}{#if candidate.scheduled_date} / 予定 {candidate.scheduled_date}{/if}</small>
-              {#if candidate.notes}<small class="candidate-notes">{candidate.notes}</small>{/if}
-              <button class="primary candidate-action" disabled={busy} aria-label={`${candidate.title}: 選択して内容確認へ進む`} onclick={() => resolveItemAction(candidate.key, false)}>
-                選択して内容確認へ進む
-              </button>
+        {#if current.pending_action.operation === 'create_item'}
+          <div class="candidate">
+            <strong class="preview-heading">{actionPreviewLabels[current.pending_action.operation]}</strong>
+            <span class="candidate-title">{changeTitle(current.pending_action.changes)}</span>
+            <div class="change-list" aria-label="追加する項目">
+              {#each current.pending_action.changes.filter((change) => change.label !== 'タイトル') as change (change.label)}
+                <div class="change-row">
+                  <strong>{change.label}</strong>
+                  <span>{change.after}</span>
+                </div>
+              {/each}
             </div>
-          {:else}
-            <p class="confirmation-target">{candidate.title}<small>{candidate.kind === 'task' ? 'Task' : 'Bute'}{candidate.status === 'completed' ? '（完了済み）' : ''} / {candidate.project ?? 'プロジェクト未設定'} / 締切 {candidate.due_date ?? '未設定'}</small>{#if candidate.notes}<small class="candidate-notes">{candidate.notes}</small>{/if}</p>
-          {/if}
-        {/each}
+          </div>
+        {:else}
+          {#each current.pending_action.candidates as candidate (candidate.key)}
+            <div class="candidate">
+              <strong class="preview-heading">{actionPreviewLabels[current.pending_action.operation]}</strong>
+              <span class="candidate-title">{candidate.title}</span>
+              <small class="candidate-meta">{itemKindLabel(candidate.kind)}{candidate.status === 'completed' ? '（完了済み）' : ''} / {candidate.project ?? 'プロジェクト未設定'} / 締切 {candidate.due_date ?? '未設定'}{#if candidate.scheduled_date} / 予定 {candidate.scheduled_date}{/if}</small>
+              {#if current.pending_action.kind === 'select' && candidate.notes && !candidate.changes.some((change) => change.label === 'メモ')}
+                <small class="candidate-notes">{candidate.notes}</small>
+              {/if}
+              <div class="change-list" aria-label="変更内容">
+                {#each candidate.changes as change (change.label)}
+                  <div class="change-row">
+                    <strong>{change.label}</strong>
+                    {#if change.before !== null}
+                      <span class="change-before">変更前: {change.before}</span>
+                      <span>変更後: {change.after}</span>
+                    {:else}
+                      <span>{change.after}</span>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+              {#if current.pending_action.kind === 'select'}
+                <button class="primary candidate-action" disabled={busy} aria-label={`${candidate.title}: 選択して内容確認へ進む`} onclick={() => resolveItemAction(candidate.key, false)}>
+                  選択して内容確認へ進む
+                </button>
+              {/if}
+            </div>
+          {/each}
+        {/if}
         <div class="confirmation-actions">
           {#if current.pending_action.kind === 'confirm' || current.pending_action.kind === 'delete'}
             <button class:danger={current.pending_action.operation === 'delete_item'} class:primary={current.pending_action.operation !== 'delete_item'} disabled={busy} onclick={() => resolveItemAction(null, true)}>{finalActionLabels[current.pending_action.operation]}</button>
@@ -317,11 +360,16 @@
   .item-confirmation { display: grid; gap: 6px; margin: 12px 0; }
   .candidate { display: grid; gap: 5px; min-width: 0; text-align: left; padding: 10px; background: #fafbfc; border: 1px solid #d8dddf; border-radius: 6px; }
   .candidate-title { font-weight: 500; }
+  .preview-heading { color: #46525a; font-size: 12px; font-weight: 600; }
   .candidate-action { width: 100%; margin-top: 5px; padding: 8px 10px; white-space: normal; overflow-wrap: anywhere; }
-  .candidate span, .confirmation-target { overflow-wrap: anywhere; font-size: 13px; }
+  .candidate span { overflow-wrap: anywhere; font-size: 13px; }
   .item-confirmation small { display: block; color: #7c858c; font-size: 11px; line-height: 1.6; }
-  .item-confirmation .candidate-notes { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
-  .confirmation-target { margin: 0 0 4px; }
+  .candidate-meta { overflow-wrap: anywhere; }
+  .candidate-notes { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .change-before { color: #7c858c; }
+  .change-list { display: grid; gap: 6px; min-width: 0; padding: 8px; background: #fff; border: 1px solid #e4e7e9; border-radius: 4px; }
+  .change-row { display: grid; gap: 2px; min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+  .change-row strong { color: #59636a; font-size: 11px; font-weight: 600; }
   .confirmation-actions { display: flex; flex-wrap: wrap; gap: 6px; }
   .compose { min-width: 0; padding: 14px; border-top: 1px solid #e8eaec; }
   .compose form { min-width: 0; }

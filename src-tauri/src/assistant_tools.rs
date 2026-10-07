@@ -29,6 +29,7 @@ pub struct PendingAction {
     pub operation: String,
     pub message: String,
     pub candidates: Vec<ActionCandidate>,
+    pub changes: Vec<ActionChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +43,14 @@ pub struct ActionCandidate {
     pub scheduled_date: Option<String>,
     pub due_date: Option<String>,
     pub priority: Priority,
+    pub changes: Vec<ActionChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionChange {
+    pub label: String,
+    pub before: Option<String>,
+    pub after: String,
 }
 
 struct PendingState {
@@ -339,6 +348,7 @@ impl AssistantTools {
                 "select",
                 name,
                 "対象のアイテムを選んでください。選択後に操作内容を確認します。",
+                &operation,
                 &matches,
             )
         };
@@ -434,20 +444,7 @@ impl AssistantTools {
         let message = match operation {
             PendingOperation::Create(input) => format!(
                 "次の内容で追加してよいですか？\n{}",
-                patch_description(&ItemPatch {
-                    title: Some(input.title.clone()),
-                    kind: Some(input.kind),
-                    notes: Some(if input.notes.is_empty() {
-                        "未設定".into()
-                    } else {
-                        input.notes.clone()
-                    }),
-                    project: Some(input.project.clone()),
-                    scheduled_date: Some(input.scheduled_date.clone()),
-                    due_date: Some(input.due_date.clone()),
-                    priority: Some(input.priority),
-                    tags: Some(input.tags.clone()),
-                })
+                patch_description(&creation_patch(input))
             ),
             operation => {
                 let item = items.first().ok_or_else(|| "対象がありません".to_owned())?;
@@ -470,7 +467,7 @@ impl AssistantTools {
         } else {
             "confirm"
         };
-        Ok(self.make_pending(kind, name, &message, items))
+        Ok(self.make_pending(kind, name, &message, operation, items))
     }
 
     pub fn cancel(&self, conversation_id: &str, token: &str) -> Result<(), String> {
@@ -510,8 +507,9 @@ impl AssistantTools {
     fn make_pending(
         &self,
         kind: &str,
-        operation: &str,
+        name: &str,
         message: &str,
+        operation: &PendingOperation,
         items: &[Item],
     ) -> ToolResult {
         let candidates: Vec<_> = items
@@ -526,14 +524,20 @@ impl AssistantTools {
                 scheduled_date: item.scheduled_date.clone(),
                 due_date: item.due_date.clone(),
                 priority: item.priority,
+                changes: operation_changes(operation, Some(item)),
             })
             .collect();
         let action = PendingAction {
             token: Uuid::new_v4().to_string(),
             kind: kind.to_owned(),
-            operation: operation.to_owned(),
+            operation: name.to_owned(),
             message: message.to_owned(),
             candidates,
+            changes: if matches!(operation, PendingOperation::Create(_)) {
+                operation_changes(operation, None)
+            } else {
+                Vec::new()
+            },
         };
         let candidate_summary: Vec<_> = action.candidates.iter().map(|candidate| json!({
             "title":candidate.title,"kind":candidate.kind,"project":candidate.project,
@@ -715,49 +719,118 @@ fn update_arguments(arguments: Value) -> Result<(String, ItemPatch), String> {
     Ok((title, patch))
 }
 
-fn patch_description(patch: &ItemPatch) -> String {
-    let nullable = |value: &Option<Option<String>>| {
-        value
-            .as_ref()
-            .map(|value| value.clone().unwrap_or_else(|| "未設定".into()))
+fn creation_patch(input: &ItemInput) -> ItemPatch {
+    ItemPatch {
+        title: Some(input.title.clone()),
+        kind: Some(input.kind),
+        notes: Some(input.notes.clone()),
+        project: Some(input.project.clone()),
+        scheduled_date: Some(input.scheduled_date.clone()),
+        due_date: Some(input.due_date.clone()),
+        priority: Some(input.priority),
+        tags: Some(input.tags.clone()),
+    }
+}
+
+fn operation_changes(operation: &PendingOperation, item: Option<&Item>) -> Vec<ActionChange> {
+    match operation {
+        PendingOperation::Create(input) => patch_changes(&creation_patch(input), None),
+        PendingOperation::Update(patch) => patch_changes(patch, item),
+        PendingOperation::Complete => vec![ActionChange {
+            label: "状態".into(),
+            before: item.map(|item| match item.status {
+                ItemStatus::Active => "未完了".into(),
+                ItemStatus::Completed => "完了".into(),
+            }),
+            after: "完了".into(),
+        }],
+        PendingOperation::Delete => vec![ActionChange {
+            label: "操作".into(),
+            before: None,
+            after: "このアイテムを削除".into(),
+        }],
+    }
+}
+
+fn patch_changes(patch: &ItemPatch, current: Option<&Item>) -> Vec<ActionChange> {
+    let text = |value: &str| {
+        if value.trim().is_empty() {
+            "未設定".into()
+        } else {
+            value.to_owned()
+        }
     };
+    let optional = |value: &Option<String>| text(value.as_deref().unwrap_or_default());
+    let kind = |kind| match kind {
+        ItemKind::Task => "Task".into(),
+        ItemKind::Bute => "Bute".into(),
+    };
+    let priority = |priority| match priority {
+        Priority::None => "未設定".into(),
+        Priority::Low => "低".into(),
+        Priority::Medium => "中".into(),
+        Priority::High => "高".into(),
+    };
+    let tags = |tags: &[String]| text(&tags.join("、"));
     [
-        ("タイトル", patch.title.clone()),
+        (
+            "タイトル",
+            current.map(|item| item.title.clone()),
+            patch.title.clone(),
+        ),
         (
             "種類",
-            patch.kind.map(|kind| match kind {
-                ItemKind::Task => "Task".into(),
-                ItemKind::Bute => "Bute".into(),
-            }),
+            current.map(|item| kind(item.kind)),
+            patch.kind.map(kind),
         ),
-        ("プロジェクト", nullable(&patch.project)),
-        ("予定日", nullable(&patch.scheduled_date)),
-        ("締切日", nullable(&patch.due_date)),
+        (
+            "プロジェクト",
+            current.map(|item| optional(&item.project)),
+            patch.project.as_ref().map(optional),
+        ),
+        (
+            "予定日",
+            current.map(|item| optional(&item.scheduled_date)),
+            patch.scheduled_date.as_ref().map(optional),
+        ),
+        (
+            "締切日",
+            current.map(|item| optional(&item.due_date)),
+            patch.due_date.as_ref().map(optional),
+        ),
         (
             "優先度",
-            patch.priority.map(|priority| match priority {
-                Priority::None => "未設定".into(),
-                Priority::Low => "低".into(),
-                Priority::Medium => "中".into(),
-                Priority::High => "高".into(),
-            }),
+            current.map(|item| priority(item.priority)),
+            patch.priority.map(priority),
         ),
         (
             "タグ",
-            patch.tags.as_ref().map(|tags| {
-                if tags.is_empty() {
-                    "未設定".into()
-                } else {
-                    tags.join("、")
-                }
-            }),
+            current.map(|item| tags(&item.tags)),
+            patch.tags.as_ref().map(|value| tags(value)),
         ),
-        ("メモ", patch.notes.clone()),
+        (
+            "メモ",
+            current.map(|item| text(&item.notes)),
+            patch.notes.as_ref().map(|value| text(value)),
+        ),
     ]
     .into_iter()
-    .filter_map(|(label, value)| value.map(|value| format!("{label}: {value}")))
-    .collect::<Vec<_>>()
-    .join("\n")
+    .filter_map(|(label, before, after)| {
+        after.map(|after| ActionChange {
+            label: label.into(),
+            before,
+            after,
+        })
+    })
+    .collect()
+}
+
+fn patch_description(patch: &ItemPatch) -> String {
+    patch_changes(patch, None)
+        .into_iter()
+        .map(|change| format!("{}: {}", change.label, change.after))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn update_one(
@@ -1356,6 +1429,97 @@ mod tests {
             .unwrap();
         let completed = approve(&tools, &service, "c1", completed);
         assert_eq!(completed.output["item"]["status"], "completed");
+    }
+
+    #[test]
+    fn previews_show_each_candidates_actual_values_and_all_planned_changes() {
+        let (_directory, service) = service();
+        let tools = AssistantTools::default();
+        let proposal = tools
+            .execute_validated(&service, "c", "create_item", create_args("Same"))
+            .unwrap();
+        let preview = serde_json::to_value(&proposal.pending.as_ref().unwrap().changes).unwrap();
+        assert!(proposal.pending.as_ref().unwrap().candidates.is_empty());
+        assert_eq!(preview.as_array().unwrap().len(), 8);
+        assert!(preview
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|change| change["before"].is_null()));
+        assert_eq!(preview[0]["after"], "Same");
+        assert_eq!(preview[4]["after"], "2026-10-12");
+        assert!(service.query(&ItemQuery::default()).unwrap().is_empty());
+        approve(&tools, &service, "c", proposal);
+        let mut other = create_args("Same");
+        other["project"] = json!("Other");
+        other["tags"] = json!([]);
+        create_one(&service, create_arguments(other).unwrap()).unwrap();
+        let before = service.query(&ItemQuery::default()).unwrap();
+        let notes = format!("**メモ**\n{}", "省略しない内容".repeat(40));
+        let proposal = tools
+            .execute_validated(
+                &service,
+                "c",
+                "update_item",
+                json!({
+                    "title":"Same", "tags":["gwitg"], "due_date":null, "notes":notes
+                }),
+            )
+            .unwrap();
+        let pending = proposal.pending.unwrap();
+        assert_eq!(pending.kind, "select");
+        assert!(pending.changes.is_empty());
+        assert_eq!(pending.candidates.len(), 2);
+        for candidate in &pending.candidates {
+            let preview = serde_json::to_value(&candidate.changes).unwrap();
+            assert_eq!(
+                preview,
+                json!([
+                    {"label":"締切日", "before":"2026-10-12", "after":"未設定"},
+                    {"label":"タグ", "before":if candidate.project.as_deref() == Some("Other") { "未設定" } else { "ship" }, "after":"gwitg"},
+                    {"label":"メモ", "before":"keep me", "after":notes}
+                ])
+            );
+        }
+        let selected = &pending.candidates[0];
+        let result = tools
+            .resolve(&service, "c", &pending.token, Some(&selected.key), false)
+            .unwrap();
+        let confirmation = result.pending.as_ref().unwrap();
+        assert_eq!(confirmation.kind, "confirm");
+        assert_eq!(
+            serde_json::to_value(&confirmation.candidates[0].changes).unwrap(),
+            serde_json::to_value(&selected.changes).unwrap()
+        );
+        assert!(!result.changed);
+        assert_eq!(
+            serde_json::to_value(service.query(&ItemQuery::default()).unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        let updated = approve(&tools, &service, "c", result);
+        assert_eq!(updated.output["item"]["tags"], json!(["gwitg"]));
+        assert!(updated.output["item"]["due_date"].is_null());
+        assert_eq!(updated.output["item"]["notes"], notes);
+        for (name, label, expected_before, after) in [
+            ("complete_item", "状態", Some("未完了"), "完了"),
+            ("delete_item", "操作", None, "このアイテムを削除"),
+        ] {
+            let pending = tools
+                .execute_validated(&service, "c", name, json!({"title":"Same"}))
+                .unwrap()
+                .pending
+                .unwrap();
+            for candidate in &pending.candidates {
+                assert_eq!(
+                    serde_json::to_value(&candidate.changes).unwrap(),
+                    json!([
+                        {"label":label, "before":expected_before, "after":after}
+                    ])
+                );
+            }
+            tools.cancel("c", &pending.token).unwrap();
+        }
+        assert_eq!(service.query(&ItemQuery::default()).unwrap().len(), 2);
     }
 
     #[test]

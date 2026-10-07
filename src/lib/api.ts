@@ -12,14 +12,15 @@ export interface Catalog { projects: string[]; tags: string[] }
 export interface ChatMessage { role: 'user' | 'assistant'; content: string }
 export interface Conversation { id: string; title: string; created_at: string; updated_at: string }
 export interface Message extends ChatMessage { id: string; conversation_id: string; created_at: string }
+export interface ActionChange { label: string; before: string | null; after: string }
 export interface ActionCandidate {
   key: string; title: string; kind: ItemKind; project: string | null;
   scheduled_date: string | null; due_date: string | null; priority: Priority;
-  status: ItemStatus; notes: string;
+  status: ItemStatus; notes: string; changes: ActionChange[];
 }
 export interface PendingAction {
   token: string; kind: 'select' | 'confirm' | 'delete'; operation: 'create_item' | 'update_item' | 'complete_item' | 'delete_item';
-  message: string; candidates: ActionCandidate[];
+  message: string; candidates: ActionCandidate[]; changes: ActionChange[];
 }
 export interface ConversationDetail { conversation: Conversation; messages: Message[]; pending_action?: PendingAction | null }
 export interface AssistantSettings { base_url: string }
