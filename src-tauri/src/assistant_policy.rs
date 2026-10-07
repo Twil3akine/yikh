@@ -58,29 +58,29 @@ impl ItemOperationPolicy {
                     return Err("操作の根拠が今回のユーザー発言にありません。".into());
                 }
             }
-            let sources = args
-                .remove("sources")
-                .ok_or("指定項目の根拠を渡してください。")?;
-            let sources = sources
-                .as_object()
-                .ok_or("指定項目の根拠はオブジェクトで渡してください。")?;
-            for (field, source) in sources {
-                if !MUTABLE_FIELDS.contains(&field.as_str()) {
-                    return Err("指定項目の根拠に不明なフィールドがあります。".into());
-                }
-                if !source
+            // Each supplied field carries its own value and evidence. Reject
+            // incomplete arguments instead of silently dropping requested changes.
+            for field in MUTABLE_FIELDS {
+                let Some(attribute) = args.get(*field) else {
+                    continue;
+                };
+                let attribute = attribute
+                    .as_object()
+                    .filter(|attribute| {
+                        attribute.len() == 2
+                            && attribute.contains_key("value")
+                            && attribute.contains_key("source")
+                    })
+                    .ok_or_else(|| {
+                        format!("Tool引数の{field}にvalueとsourceを一組で渡してください。")
+                    })?;
+                if !attribute["source"]
                     .as_str()
                     .is_some_and(|source| self.contains_source(source))
                 {
                     return Err("指定項目の根拠が今回のユーザー発言にありません。".into());
                 }
-            }
-            // Omitted fields cannot inherit values guessed from other Items.
-            // Existing patch handling preserves them on update; create uses defaults.
-            for field in MUTABLE_FIELDS {
-                if !sources.contains_key(*field) {
-                    args.remove(*field);
-                }
+                args.insert((*field).into(), attribute["value"].clone());
             }
             let title = args
                 .get("title")
@@ -91,6 +91,11 @@ impl ItemOperationPolicy {
             }
             if name == "create_item" && !args.contains_key("kind") {
                 args.insert("kind".into(), json!("task"));
+            }
+            if name == "update_item" && args.len() == 1 {
+                return Err(
+                    "Assistantが更新内容を読み取れませんでした。Itemは変更していません。".into(),
+                );
             }
         }
         for field in ["scheduled_date", "due_date", "due_from", "due_to"] {
@@ -167,44 +172,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn structured_sources_control_fields_without_parsing_japanese_labels() {
-        let request = "AufyのPJをAutomationにしてもらえるかな";
+    fn paired_attributes_preserve_requested_values_and_reject_incomplete_evidence() {
+        let request = "AufyのプロジェクトをAutomationにしてもらえるかな";
         let policy =
             ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
-        let mut raw = json!({"title":"Aufyの開発", "project":"Automation", "priority":"high", "notes":"他Itemから推測", "tags":["A"],
-            "instruction":request, "reference":"Aufy", "sources":{"project":"PJをAutomationにして"}});
+        let raw = json!({"title":"Aufyの開発",
+            "project":{"value":"Automation","source":"プロジェクトをAutomationにして"},
+            "instruction":request, "reference":"Aufy"});
         let args = policy.validate("update_item", raw.clone()).unwrap();
-        assert_eq!(args["project"], "Automation");
-        for field in [
-            "priority",
-            "notes",
-            "tags",
-            "instruction",
-            "reference",
-            "sources",
+        assert_eq!(args, json!({"title":"Aufyの開発","project":"Automation"}));
+        for invalid in [
+            json!({"value":"Automation"}),
+            json!({"source":"プロジェクトをAutomationにして"}),
+            json!({"value":"Automation","source":"以前の会話にある指定"}),
+            json!("Automation"),
         ] {
-            assert!(args.get(field).is_none());
+            let mut incomplete = raw.clone();
+            incomplete["project"] = invalid;
+            assert!(policy.validate("update_item", incomplete).is_err());
         }
-        raw["sources"]["project"] = json!("以前の会話にある指定");
-        assert!(policy.validate("update_item", raw).is_err());
+        let mut empty_update = raw;
+        empty_update.as_object_mut().unwrap().remove("project");
+        let error = policy.validate("update_item", empty_update).unwrap_err();
+        assert!(error.contains("Assistantが更新内容を読み取れませんでした"));
         assert!(policy.validate("external_tool", json!({})).is_err());
     }
 
     #[test]
-    fn create_uses_defaults_for_unspecified_attributes_and_accepts_sourced_notes() {
+    fn create_defaults_unspecified_attributes_and_requires_evidence_for_supplied_values() {
         let request = "butesにAufyの開発を入れて。低めの優先度で、メモにはgithubのtwil3akineのgwitgのURLを保存して";
         let policy =
             ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
-        let raw = json!({"title":"Aufyの開発", "kind":"bute", "priority":"low", "notes":"https://github.com/twil3akine/gwitg", "project":"A", "tags":["A"],
-            "instruction":request, "reference":"Aufyの開発", "sources":{"kind":"butes", "priority":"低めの優先度", "notes":"メモにはgithubのtwil3akineのgwitgのURLを保存して"}});
+        let raw = json!({"title":"Aufyの開発",
+            "kind":{"value":"bute","source":"butes"},
+            "priority":{"value":"low","source":"低めの優先度"},
+            "notes":{"value":"https://github.com/twil3akine/gwitg","source":"メモにはgithubのtwil3akineのgwitgのURLを保存して"},
+            "instruction":request,"reference":"Aufyの開発"});
         let args = policy.validate("create_item", raw.clone()).unwrap();
         assert_eq!(args["kind"], "bute");
         assert_eq!(args["priority"], "low");
         assert_eq!(args["notes"], "https://github.com/twil3akine/gwitg");
         assert!(args.get("project").is_none() && args.get("tags").is_none());
-        let mut without_sources = raw;
-        without_sources["sources"] = json!({});
-        let args = policy.validate("create_item", without_sources).unwrap();
+        for field in ["priority", "project", "tags", "notes"] {
+            let mut guessed = raw.clone();
+            guessed[field] = json!({"value":"他Itemから推測","source":"以前の会話"});
+            assert!(policy.validate("create_item", guessed).is_err());
+        }
+        let args = policy
+            .validate(
+                "create_item",
+                json!({"title":"Aufyの開発",
+            "instruction":request,"reference":"Aufyの開発"}),
+            )
+            .unwrap();
         assert_eq!(args["kind"], "task");
         assert!(args.get("priority").is_none() && args.get("notes").is_none());
     }
@@ -214,8 +234,10 @@ mod tests {
         let request = "レポートを今日開始、一週間後締切で追加して";
         let policy =
             ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 12, 30).unwrap());
-        let mut raw = json!({"title":"レポート", "kind":"task", "scheduled_date":{"relative":"today"}, "due_date":{"relative":"days_after","days":7},
-            "instruction":request, "reference":"レポート", "sources":{"scheduled_date":"今日開始", "due_date":"一週間後締切"}});
+        let mut raw = json!({"title":"レポート",
+            "scheduled_date":{"value":{"relative":"today"},"source":"今日開始"},
+            "due_date":{"value":{"relative":"days_after","days":7},"source":"一週間後締切"},
+            "instruction":request,"reference":"レポート"});
         let args = policy.validate("create_item", raw.clone()).unwrap();
         assert_eq!(args["scheduled_date"], "2026-12-30");
         assert_eq!(args["due_date"], "2027-01-06");
@@ -224,7 +246,7 @@ mod tests {
             json!({"relative":"unknown"}),
             json!({"relative":"days_after","days":u32::MAX}),
         ] {
-            raw["due_date"] = invalid;
+            raw["due_date"]["value"] = invalid;
             assert!(policy.validate("create_item", raw.clone()).is_err());
         }
         for (relative, expected) in [

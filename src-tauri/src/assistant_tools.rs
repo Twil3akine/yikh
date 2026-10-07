@@ -125,7 +125,7 @@ impl AssistantTools {
         definitions.push(function(
             "create_item",
             "タイトルと種類が分かれば確認せず追加します。任意項目はユーザーが指定したものだけ渡してください。",
-            optional(p, vec!["kind", "title"]),
+            optional(p, vec!["title"]),
         ));
 
         let mut p = Map::new();
@@ -182,16 +182,21 @@ impl AssistantTools {
             let properties = definition["function"]["parameters"]["properties"]
                 .as_object_mut()
                 .unwrap();
-            let source_properties: Map<_, _> = properties
-                .keys()
-                .filter(|field| field.as_str() != "title")
-                .map(|field| {
-                    (
-                        field.clone(),
-                        string("今回の発言でこの項目を指定した箇所をそのまま引用します"),
-                    )
-                })
-                .collect();
+            for (field, schema) in properties.iter_mut() {
+                if field == "title" {
+                    continue;
+                }
+                *schema = json!({
+                    "type":"object",
+                    "description":"今回指定された項目だけ、値と根拠の引用を一組で渡します",
+                    "properties":{
+                        "value":schema.clone(),
+                        "source":string("今回の発言でこの項目を指定した箇所をそのまま引用します")
+                    },
+                    "required":["value","source"],
+                    "additionalProperties":false
+                });
+            }
             properties.insert(
                 "instruction".into(),
                 string("今回の発言で操作を依頼した箇所をそのまま引用します"),
@@ -200,11 +205,10 @@ impl AssistantTools {
                 "reference".into(),
                 string("今回の発言と対象タイトルに含まれる名前の部分をそのまま引用します"),
             );
-            properties.insert("sources".into(), json!({"type":"object","properties":source_properties,"additionalProperties":false}));
             definition["function"]["parameters"]["required"]
                 .as_array_mut()
                 .unwrap()
-                .extend([json!("instruction"), json!("reference"), json!("sources")]);
+                .extend([json!("instruction"), json!("reference")]);
         }
 
         json!(definitions)
@@ -862,13 +866,12 @@ mod tests {
 
     fn with_sources(request: &str, reference: &str, mut args: Value, fields: &[&str]) -> Value {
         let object = args.as_object_mut().unwrap();
-        let sources = fields
-            .iter()
-            .map(|field| ((*field).to_owned(), json!(request)))
-            .collect::<Map<_, _>>();
+        for field in fields {
+            let value = object.remove(*field).unwrap();
+            object.insert((*field).into(), json!({"value":value,"source":request}));
+        }
         object.insert("instruction".into(), json!(request));
         object.insert("reference".into(), json!(reference));
-        object.insert("sources".into(), Value::Object(sources));
         args
     }
 
@@ -884,8 +887,7 @@ mod tests {
         let added = tools.execute(&service, "c", "create_item", with_sources(
             policy.request(), "OSS課題レポート", json!({
             "title":"OSS課題レポート","kind":"task",
-            "scheduled_date":{"relative":"today"}, "due_date":{"relative":"days_after","days":7},
-            "priority":"high","project":"大学","tags":["課題"],"notes":"別の課題から推測"
+            "scheduled_date":{"relative":"today"}, "due_date":{"relative":"days_after","days":7}
             }), &["kind", "scheduled_date", "due_date"]), &policy).unwrap();
         assert!(added.changed && added.pending.is_none());
         let item = service.query(&ItemQuery::default()).unwrap().remove(0);
@@ -899,7 +901,12 @@ mod tests {
                 &service,
                 "c",
                 "update_item",
-                with_sources(policy.request(), "OSS課題レポート", json!({"title":"OSS課題レポート","due_date":"2026-10-16","scheduled_date":"2026-10-16","priority":"high"}), &["due_date"]),
+                with_sources(
+                    policy.request(),
+                    "OSS課題レポート",
+                    json!({"title":"OSS課題レポート","due_date":"2026-10-16"}),
+                    &["due_date"],
+                ),
                 &policy,
             )
             .unwrap();
@@ -986,7 +993,20 @@ mod tests {
 
         let bute_policy =
             ItemOperationPolicy::new("butesにAufyの開発を無期限で入れといて、優先度低めで", today);
-        let added = tools.execute(&service, "c", "create_item", with_sources(bute_policy.request(), "Aufyの開発", json!({"title":"Aufyの開発","kind":"bute","due_date":null,"priority":"low","project":"A","notes":"推測したメモ","tags":["development"]}), &["kind", "due_date", "priority"]), &bute_policy).unwrap();
+        let added = tools
+            .execute(
+                &service,
+                "c",
+                "create_item",
+                with_sources(
+                    bute_policy.request(),
+                    "Aufyの開発",
+                    json!({"title":"Aufyの開発","kind":"bute","due_date":null,"priority":"low"}),
+                    &["kind", "due_date", "priority"],
+                ),
+                &bute_policy,
+            )
+            .unwrap();
         assert!(added.changed && added.pending.is_none());
         assert!(!added.output["message"]
             .as_str()

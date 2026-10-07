@@ -224,16 +224,16 @@ const SYSTEM_PROMPT: &str = r#"あなたはYikhのローカル作業アシスタ
 - 追加はcreate_item、編集はupdate_item、完了の報告はcomplete_item、削除の依頼はdelete_itemを使います。対象と内容が分かれば、削除以外に不要な確認を挟まないでください。最新一覧から判断できる操作は、先にlist_itemsを呼ばず、操作Toolを直接呼んでください。
 - 変更対象以外の属性を推測しないでください。他Itemや過去の会話の属性を新しいItemへ引き継がないでください。種類が未指定の追加はTask、その他の任意属性は未設定です。編集は指定された項目だけを渡し、既存値を再送しないでください。
 - mutation Toolのinstructionには、今回の発言で操作を依頼した箇所をそのまま引用してください。referenceには、今回の発言と対象タイトルの両方に含まれる名前の部分をそのまま引用してください。助詞や操作の言葉を含める必要はありません。既存Itemのtitleは最新一覧にある正式なタイトルを渡します。referenceを履歴や一覧から作らないでください。
-- sourcesには、ユーザーが今回指定した任意属性だけをフィールド名と原文の引用で列挙してください。kind、new_title、project、priority、tags、notes、scheduled_date、due_dateが対象です。引用はその属性を指定した最小限の箇所にし、発言全体を無条件に全属性へコピーしないでください。指定のないフィールドは引数にもsourcesにも含めません。complete_itemとdelete_itemのsourcesは空オブジェクトです。
+- create_itemとupdate_itemの属性は、各項目に{"value":値,"source":"今回の発言からの引用"}を渡してください。値と引用は必ず同じ項目に置き、別のsourcesマップは作りません。kind、new_title、project、priority、tags、notes、scheduled_date、due_dateが対象です。引用はその属性を指定した最小限の箇所にし、発言全体を無条件に全属性へコピーしないでください。指定されていない項目は渡しません。update_itemには必ず一つ以上の変更項目を含めてください。complete_itemとdelete_itemに属性は不要です。
 - 属性の値は引用の意味に従って正規化します。優先度はnone/low/medium/high、日付はYYYY-MM-DDか相対日付オブジェクトです。メモにURLを求められ、サービスと所有者とリポジトリが明示されている場合は、その指定からURLを組み立てて構いません。知らない所有者やリポジトリを補わないでください。
 - 今日、明日、明後日、一週間後、来週などは相対日付オブジェクトで渡し、実際の日付はRustに解決させてください。来週は次の月曜日、一週間後は7日後、今週は月曜から日曜です。
 - 短縮名に合う候補が複数ある場合は、referenceを特定候補へ勝手に狭めないでください。アプリが候補選択を表示します。同名Itemも勝手に選びません。削除は確認ボタンで承認されるまで実行されません。
 
 引数の例です。最新一覧に「解析資料づくり」があり、ユーザーが「解析資料の所属を研究へ移して」と頼んだ場合はupdate_itemに次を渡します。
-{"title":"解析資料づくり","project":"研究","instruction":"所属を研究へ移して","reference":"解析資料","sources":{"project":"所属を研究へ移して"}}
+{"title":"解析資料づくり","project":{"value":"研究","source":"所属を研究へ移して"},"instruction":"所属を研究へ移して","reference":"解析資料"}
 優先度や予定日は変更していないため、引数に含めません。「解析資料は終わりましたか？」は状態の質問なのでlist_itemsで確認し、complete_itemは使いません。この例のItemや属性を実際の依頼へ流用しないでください。
 
-Tool実行前に成功したと答えないでください。成功後は結果だけを簡潔に返してください。Tool定義が渡されていない場合は参照結果だけを回答し、Itemを変更したと答えないでください。"#;
+Toolの検証エラーが返ったら、今回の発言とTool定義を読み直し、引数を修正してください。依頼に書かれている情報をユーザーへ再度質問しないでください。Tool実行前に成功したと答えないでください。成功後は結果だけを簡潔に返してください。Tool定義が渡されていない場合は参照結果だけを回答し、Itemを変更したと答えないでください。"#;
 
 #[derive(Serialize)]
 struct ItemSnapshot<'a> {
@@ -522,6 +522,13 @@ fn apply_calls(
         let output = match serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
             Err(_) => serde_json::json!({"error":"引数をJSON形式で指定してください。"}),
             Ok(arguments) => {
+                // Live smoke tests use only a temporary database. Keep personal
+                // conversation contents out of normal application logs.
+                #[cfg(test)]
+                eprintln!(
+                    "[yikh assistant test] {}: {}",
+                    call.function.name, arguments
+                );
                 // A request still awaiting inference must not act for a deleted conversation.
                 service.get_conversation(tools.conversation_id)?;
                 let key = format!("{}:{}", call.function.name, arguments);
@@ -718,12 +725,10 @@ mod tests {
     ) -> serde_json::Value {
         args["instruction"] = serde_json::json!(request);
         args["reference"] = serde_json::json!(reference);
-        args["sources"] = serde_json::Value::Object(
-            fields
-                .iter()
-                .map(|field| ((*field).into(), serde_json::json!(request)))
-                .collect(),
-        );
+        for field in fields {
+            let value = args.as_object_mut().unwrap().remove(*field).unwrap();
+            args[*field] = serde_json::json!({"value":value,"source":request});
+        }
         args
     }
 
@@ -794,8 +799,21 @@ mod tests {
             let required = definition["function"]["parameters"]["required"]
                 .as_array()
                 .unwrap();
-            for name in ["instruction", "reference", "sources"] {
+            for name in ["instruction", "reference"] {
                 assert!(required.contains(&serde_json::json!(name)));
+            }
+            let properties = &definition["function"]["parameters"]["properties"];
+            assert!(properties.get("sources").is_none());
+            for (name, attribute) in properties.as_object().unwrap() {
+                if matches!(name.as_str(), "title" | "instruction" | "reference") {
+                    continue;
+                }
+                assert_eq!(attribute["type"], "object");
+                assert_eq!(
+                    attribute["required"],
+                    serde_json::json!(["value", "source"])
+                );
+                assert_eq!(attribute["additionalProperties"], false);
             }
         }
         let read = serde_json::to_value(CompletionRequest::new(&messages, None, None)).unwrap();
@@ -936,6 +954,37 @@ mod tests {
             "https://github.com/twil3akine/gwitg"
         );
         assert_eq!(changed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let updated = runtime
+            .block_on(answer_with_tools(
+                &service,
+                &http_client().unwrap(),
+                "AufyのプロジェクトをAutomationにしてもらえるかな".into(),
+                vec![ChatMessage {
+                    role: "assistant".into(),
+                    content: reply.content,
+                }],
+                ToolContext {
+                    runtime: &tools,
+                    conversation_id: &conversation.conversation.id,
+                    on_changed: &notify,
+                },
+            ))
+            .unwrap_or_else(|error| panic!("Ornith project update failed: {error}"));
+        assert!(updated.pending.is_none());
+        let updated = service
+            .query(&ItemQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|updated| updated.id == item.id)
+            .unwrap();
+        assert_eq!(updated.project.as_deref(), Some("Automation"));
+        assert_eq!(updated.kind, item.kind);
+        assert_eq!(updated.notes, item.notes);
+        assert_eq!(updated.priority, item.priority);
+        assert_eq!(updated.scheduled_date, item.scheduled_date);
+        assert_eq!(updated.due_date, item.due_date);
+        assert_eq!(updated.tags, item.tags);
+        assert_eq!(changed.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1006,7 +1055,10 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         for (request, title) in [
-            ("AufyのPJをAutomationにしてもらえるかな", "Aufyの開発"),
+            (
+                "AufyのプロジェクトをAutomationにしてもらえるかな",
+                "Aufyの開発",
+            ),
             ("AufyのPJをAutomationにしてもらえるかな", "Aufy"),
             ("Aufyの開発のPJをAutomationにしてもらえるかな", "Aufyの開発"),
         ] {
@@ -1038,8 +1090,7 @@ mod tests {
             let answer: CompletionAnswer = serde_json::from_value(serde_json::json!({
                 "tool_calls": [{"type":"function", "function": {
                     "name":"update_item", "arguments": sourced_args(request,"Aufy",serde_json::json!({
-                        "title":title, "project":"Automation", "priority":"high", "notes":"推測したメモ",
-                        "tags":["other"], "scheduled_date":"2026-10-08", "due_date":"2026-10-14"
+                        "title":title, "project":"Automation"
                     }), &["project"]).to_string()
                 }}]
             })).unwrap();
@@ -1170,7 +1221,7 @@ mod tests {
         let answer = || -> CompletionAnswer {
             serde_json::from_value(serde_json::json!({
                 "tool_calls": [{"type":"function", "function": {
-                    "name":"update_item", "arguments":sourced_args("課題を変更して","課題",serde_json::json!({"title":"課題","project":"推測"}), &[]).to_string()
+                    "name":"update_item", "arguments":sourced_args("課題を変更して","課題",serde_json::json!({"title":"課題"}), &[]).to_string()
                 }}]
             }))
             .unwrap()
@@ -1189,7 +1240,10 @@ mod tests {
         .is_none());
         let first: serde_json::Value =
             serde_json::from_str(messages.last().unwrap().content.as_deref().unwrap()).unwrap();
-        assert_eq!(first["error"], "変更する項目を指定してください。");
+        assert_eq!(
+            first["error"],
+            "Assistantが更新内容を読み取れませんでした。Itemは変更していません。"
+        );
         let error = apply_calls(
             &service,
             answer(),
