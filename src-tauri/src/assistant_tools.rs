@@ -12,6 +12,7 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct AssistantTools {
     pending: Mutex<HashMap<String, PendingState>>,
+    recent_targets: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,9 +203,24 @@ impl AssistantTools {
             if definition["function"]["name"] == "list_items" {
                 continue;
             }
+            let existing_target = matches!(
+                definition["function"]["name"].as_str().unwrap_or_default(),
+                "update_item" | "complete_item" | "delete_item"
+            );
+            let reference_description = if existing_target {
+                "今回の発言から対象名を引用します。対象名を省略した場合は必ず空文字を指定します"
+            } else {
+                "今回の依頼原文と対象タイトルの両方に含まれる名前の部分を原文のまま引用します。正式タイトルへ補完しません"
+            };
             let properties = definition["function"]["parameters"]["properties"]
                 .as_object_mut()
                 .unwrap();
+            if existing_target {
+                properties.insert(
+                    "title".into(),
+                    string("対象名を明示した場合はそのタイトルを指定します。省略時は直前に確認した候補のタイトル、候補がない場合は空文字を指定します"),
+                );
+            }
             if let Some(title) = properties.remove("title") {
                 let variants: Vec<_> = std::mem::take(properties)
                     .into_iter()
@@ -231,10 +247,7 @@ impl AssistantTools {
             let properties = definition["function"]["parameters"]["properties"]
                 .as_object_mut()
                 .unwrap();
-            properties.insert(
-                "reference".into(),
-                string("今回の依頼原文と対象タイトルの両方に含まれる名前の部分を原文のまま引用します。正式タイトルへ補完しません"),
-            );
+            properties.insert("reference".into(), string(reference_description));
             definition["function"]["parameters"]["required"]
                 .as_array_mut()
                 .unwrap()
@@ -252,6 +265,8 @@ impl AssistantTools {
         arguments: Value,
         policy: &ItemOperationPolicy,
     ) -> Result<ToolResult, String> {
+        let use_follow_up_target = matches!(name, "update_item" | "complete_item" | "delete_item")
+            && arguments.get("reference").and_then(Value::as_str) == Some("");
         let validated = match policy.validate(name, arguments) {
             Ok(validated) => validated,
             Err(ValidationError::Clarification(question)) => return Ok(clarification(question)),
@@ -265,13 +280,25 @@ impl AssistantTools {
                     "対象のアイテムが見つかりません。操作したいアイテムのタイトルを教えてください。".into(),
                 ));
             }
-            Some(crate::assistant_targets::resolve_targets(
-                items,
-                validated.reference.as_deref().unwrap_or_default(),
-                arguments["title"]
-                    .as_str()
-                    .ok_or("対象のタイトルを指定してください。")?,
-            )?)
+            if let Some(hint) = policy.follow_up_target().filter(|_| use_follow_up_target) {
+                let Some(item) = items.into_iter().find(|item| item.id == hint.id) else {
+                    return Ok(clarification(
+                        "対象のアイテムが見つかりません。操作したいアイテムのタイトルを教えてください。".into(),
+                    ));
+                };
+                Some(crate::assistant_targets::TargetResolution {
+                    items: vec![item],
+                    needs_confirmation: false,
+                })
+            } else {
+                Some(crate::assistant_targets::resolve_targets(
+                    items,
+                    validated.reference.as_deref().unwrap_or_default(),
+                    arguments["title"]
+                        .as_str()
+                        .ok_or("対象のタイトルを指定してください。")?,
+                )?)
+            }
         } else {
             None
         };
@@ -413,25 +440,45 @@ impl AssistantTools {
                 return Err("選択肢が無効です".to_owned());
             }
         }
-        let result = match operation {
-            PendingOperation::Create(input) => create_one(service, input)?,
+        // Acquire both state locks before writing, so a poisoned lock cannot
+        // turn a successful database mutation into an apparent failure.
+        let mut recent_targets = self
+            .recent_targets
+            .lock()
+            .map_err(|_| "Assistantの操作状態を利用できません".to_owned())?;
+        let (result, recent_target) = match operation {
+            PendingOperation::Create(input) => {
+                let (result, item) = create_one_with_item(service, input)?;
+                (result, Some(item.id))
+            }
             operation => {
                 let item = candidates
                     .first()
                     .ok_or_else(|| "対象がありません".to_owned())?;
                 ensure_fresh(service, item)?;
                 match operation {
-                    PendingOperation::Update(patch) => update_one(service, item, patch)?,
-                    PendingOperation::Complete => complete_one(service, item)?,
+                    PendingOperation::Update(patch) => {
+                        (update_one(service, item, patch)?, Some(item.id.clone()))
+                    }
+                    PendingOperation::Complete => {
+                        (complete_one(service, item)?, Some(item.id.clone()))
+                    }
                     PendingOperation::Delete => {
                         service.delete(&item.id)?;
-                        success(format!("「{}」を削除しました。", item.title), None)
+                        (
+                            success(format!("「{}」を削除しました。", item.title), None),
+                            None,
+                        )
                     }
                     PendingOperation::Create(_) => unreachable!(),
                 }
             }
         };
         pending_map.remove(conversation_id);
+        recent_targets.remove(conversation_id);
+        if let Some(item_id) = recent_target {
+            recent_targets.insert(conversation_id.to_owned(), item_id);
+        }
         Ok(result)
     }
 
@@ -482,6 +529,10 @@ impl AssistantTools {
             return Err("この操作確認は無効か、別の会話に属しています".to_owned());
         }
         pending.remove(conversation_id);
+        self.recent_targets
+            .lock()
+            .map_err(|_| "Assistantの操作状態を利用できません".to_owned())?
+            .remove(conversation_id);
         Ok(())
     }
 
@@ -501,6 +552,33 @@ impl AssistantTools {
             .lock()
             .map_err(|_| "Assistantの操作状態を利用できません".to_owned())?
             .remove(conversation_id);
+        Ok(())
+    }
+
+    pub(crate) fn take_recent_target(
+        &self,
+        service: &ItemService,
+        conversation_id: &str,
+    ) -> Result<Option<Item>, String> {
+        let item_id = self
+            .recent_targets
+            .lock()
+            .map_err(|_| "Assistantの操作状態を利用できません".to_owned())?
+            .remove(conversation_id);
+        let Some(item_id) = item_id else {
+            return Ok(None);
+        };
+        Ok(service
+            .query(&ItemQuery::default())?
+            .into_iter()
+            .find(|item| item.id == item_id))
+    }
+
+    pub(crate) fn forget_recent_target(&self, id: &str) -> Result<(), String> {
+        self.recent_targets
+            .lock()
+            .map_err(|_| "Assistantの操作状態を利用できません".to_owned())?
+            .remove(id);
         Ok(())
     }
 
@@ -673,7 +751,15 @@ fn create_arguments(arguments: Value) -> Result<ItemInput, String> {
     Ok(input)
 }
 
+#[cfg(test)]
 fn create_one(service: &ItemService, input: ItemInput) -> Result<ToolResult, String> {
+    create_one_with_item(service, input).map(|(result, _)| result)
+}
+
+fn create_one_with_item(
+    service: &ItemService,
+    input: ItemInput,
+) -> Result<(ToolResult, Item), String> {
     let item = service.create(input)?;
     let mut message = format!("「{}」を追加しました。", item.title);
     match (&item.scheduled_date, &item.due_date) {
@@ -684,7 +770,7 @@ fn create_one(service: &ItemService, input: ItemInput) -> Result<ToolResult, Str
         (None, Some(due)) => message.push_str(&format!("\n締切は{due}です。")),
         (None, None) => {}
     }
-    Ok(success(message, Some(item)))
+    Ok((success(message, Some(item.clone())), item))
 }
 
 fn update_arguments(arguments: Value) -> Result<(String, ItemPatch), String> {
@@ -1558,6 +1644,170 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn recent_target_is_recorded_only_after_confirmation_and_taken_once_per_conversation() {
+        let (_directory, service) = service();
+        let tools = AssistantTools::default();
+        let proposal = tools
+            .execute_validated(&service, "c1", "create_item", create_args("Recent"))
+            .unwrap();
+        assert!(tools.take_recent_target(&service, "c1").unwrap().is_none());
+        let created = approve(&tools, &service, "c1", proposal);
+        assert!(created.changed);
+        let actual_id = service
+            .query(&ItemQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|item| item.title == "Recent")
+            .unwrap()
+            .id;
+        assert!(tools.take_recent_target(&service, "c2").unwrap().is_none());
+        let recent = tools.take_recent_target(&service, "c1").unwrap().unwrap();
+        assert_eq!(recent.title, "Recent");
+        assert_eq!(recent.id, actual_id);
+        assert!(tools.take_recent_target(&service, "c1").unwrap().is_none());
+
+        let proposal = tools
+            .execute_validated(
+                &service,
+                "c1",
+                "update_item",
+                json!({"title":"Recent","notes":"updated"}),
+            )
+            .unwrap();
+        assert!(tools.take_recent_target(&service, "c1").unwrap().is_none());
+        approve(&tools, &service, "c1", proposal);
+        let proposal = tools
+            .execute_validated(&service, "c1", "complete_item", json!({"title":"Recent"}))
+            .unwrap();
+        let pending = proposal.pending.unwrap();
+        tools.cancel("c1", &pending.token).unwrap();
+        assert!(tools.take_recent_target(&service, "c1").unwrap().is_none());
+        assert_eq!(
+            service.query(&ItemQuery::default()).unwrap()[0].notes,
+            "updated"
+        );
+
+        let proposal = tools
+            .execute_validated(&service, "c1", "complete_item", json!({"title":"Recent"}))
+            .unwrap();
+        approve(&tools, &service, "c1", proposal);
+        assert_eq!(
+            service.query(&ItemQuery::default()).unwrap()[0].status,
+            ItemStatus::Completed
+        );
+
+        let proposal = tools
+            .execute_validated(&service, "c1", "delete_item", json!({"title":"Recent"}))
+            .unwrap();
+        approve(&tools, &service, "c1", proposal);
+        assert!(tools.take_recent_target(&service, "c1").unwrap().is_none());
+
+        let proposal = tools
+            .execute_validated(&service, "c1", "create_item", create_args("Forgotten"))
+            .unwrap();
+        approve(&tools, &service, "c1", proposal);
+        tools.forget_recent_target("c1").unwrap();
+        assert!(tools.take_recent_target(&service, "c1").unwrap().is_none());
+
+        let proposal = tools
+            .execute_validated(&service, "c1", "create_item", create_args("Gone"))
+            .unwrap();
+        approve(&tools, &service, "c1", proposal);
+        let item = service
+            .query(&ItemQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|item| item.title == "Gone")
+            .unwrap();
+        service.delete(&item.id).unwrap();
+        assert!(tools.take_recent_target(&service, "c1").unwrap().is_none());
+    }
+
+    #[test]
+    fn omitted_target_uses_recent_id_for_preview_and_explicit_reference_takes_priority() {
+        let (_directory, service) = service();
+        let tools = AssistantTools::default();
+        create_one(
+            &service,
+            create_arguments(create_args("Recent target")).unwrap(),
+        )
+        .unwrap();
+        create_one(
+            &service,
+            create_arguments(create_args("Explicit target")).unwrap(),
+        )
+        .unwrap();
+        let items = service.query(&ItemQuery::default()).unwrap();
+        let recent = items
+            .iter()
+            .find(|item| item.title == "Recent target")
+            .unwrap()
+            .clone();
+        let policy = ItemOperationPolicy::new(
+            "予定日を2026-10-20、優先度を高に変更して",
+            NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(),
+        )
+        .with_follow_up_target(Some(recent.clone()));
+        let proposal = tools
+            .execute(
+                &service,
+                "c",
+                "update_item",
+                json!({
+                    "title":"",
+                    "reference":"",
+                    "changes":[
+                        {"field":"scheduled_date","value":"2026-10-20","source":"予定日を2026-10-20"},
+                        {"field":"priority","value":"high","source":"優先度を高"}
+                    ]
+                }),
+                &policy,
+            )
+            .unwrap();
+        let pending = proposal.pending.as_ref().unwrap();
+        assert_eq!(pending.kind, "confirm");
+        assert_eq!(pending.candidates.len(), 1);
+        assert_eq!(pending.candidates[0].title, "Recent target");
+        assert_eq!(pending.candidates[0].changes.len(), 2);
+        assert_eq!(pending.candidates[0].changes[0].after, "2026-10-20");
+        assert_eq!(pending.candidates[0].changes[1].after, "高");
+        let unchanged = service
+            .query(&ItemQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == recent.id)
+            .unwrap();
+        assert_eq!(unchanged.scheduled_date, recent.scheduled_date);
+        assert_eq!(unchanged.priority, recent.priority);
+
+        let changed = tools
+            .resolve(&service, "c", &pending.token, None, true)
+            .unwrap();
+        assert!(changed.changed);
+        assert_eq!(changed.output["item"]["scheduled_date"], "2026-10-20");
+        assert_eq!(changed.output["item"]["priority"], "high");
+
+        let explicit = ItemOperationPolicy::new(
+            "Explicit target を完了して",
+            NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(),
+        )
+        .with_follow_up_target(Some(recent));
+        let proposal = tools
+            .execute(
+                &service,
+                "c2",
+                "complete_item",
+                json!({"title":"Recent target","reference":"Explicit target"}),
+                &explicit,
+            )
+            .unwrap();
+        let pending = proposal.pending.unwrap();
+        assert_eq!(pending.kind, "select");
+        assert_eq!(pending.candidates.len(), 1);
+        assert_eq!(pending.candidates[0].title, "Explicit target");
     }
 
     #[test]

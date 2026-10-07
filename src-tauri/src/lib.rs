@@ -126,6 +126,7 @@ fn delete_conversation(
     id: String,
 ) -> Result<(), String> {
     tools.clear(&id)?;
+    tools.forget_recent_target(&id)?;
     service.delete_conversation(&id)
 }
 

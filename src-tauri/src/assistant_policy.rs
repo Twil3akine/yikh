@@ -1,5 +1,6 @@
 use crate::assistant_dates::resolve_date;
 use crate::assistant_routing::{ItemPlan, FIELDS as MUTABLE_FIELDS};
+use crate::model::Item;
 use chrono::NaiveDate;
 use serde_json::{json, Value};
 
@@ -8,6 +9,7 @@ use serde_json::{json, Value};
 pub(crate) struct ItemOperationPolicy {
     request: String,
     today: NaiveDate,
+    follow_up_target: Option<Item>,
 }
 
 #[derive(Debug)]
@@ -40,7 +42,17 @@ impl ItemOperationPolicy {
         Self {
             request: request.to_lowercase(),
             today,
+            follow_up_target: None,
         }
+    }
+
+    pub(crate) fn with_follow_up_target(mut self, target: Option<Item>) -> Self {
+        self.follow_up_target = target;
+        self
+    }
+
+    pub(crate) fn follow_up_target(&self) -> Option<&Item> {
+        self.follow_up_target.as_ref()
     }
 
     #[cfg(test)]
@@ -86,10 +98,18 @@ impl ItemOperationPolicy {
         if name != "list_items" {
             // Target evidence and attribute evidence are independent. A target
             // quote mismatch may require selection, but never authorizes a write.
-            reference = args
-                .remove("reference")
+            let raw_reference = args.remove("reference");
+            let omitted_reference = raw_reference.as_ref().and_then(Value::as_str) == Some("");
+            reference = raw_reference
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .filter(|value| self.contains_source(value));
+            // Only an explicitly omitted target may use the last confirmed Item
+            // as a suggestion. Attribute evidence still comes from this request.
+            if omitted_reference && name != "create_item" {
+                if let Some(target) = self.follow_up_target() {
+                    args.insert("title".into(), json!(target.title));
+                }
+            }
             // Each supplied field carries its own value and evidence. Reject
             // incomplete arguments instead of silently dropping requested changes.
             for field in MUTABLE_FIELDS {
