@@ -104,6 +104,54 @@ struct CompletionResponse {
 #[derive(Debug, Deserialize)]
 struct CompletionChoice {
     message: Option<CompletionAnswer>,
+    finish_reason: Option<String>,
+}
+
+impl CompletionChoice {
+    fn into_answer(self) -> Result<CompletionAnswer, String> {
+        #[cfg(test)]
+        if let Some(message) = self
+            .message
+            .as_ref()
+            .filter(|message| message.tool_calls.is_empty())
+        {
+            // Live smoke tests use an isolated database and expose the failed final
+            // response for diagnosis. Production never logs message text.
+            eprintln!(
+                "[yikh assistant test] response content={:?}",
+                message.content
+            );
+        }
+        #[cfg(debug_assertions)]
+        {
+            let reason = match self.finish_reason.as_deref() {
+                Some("stop") => "stop",
+                Some("length") => "length",
+                Some("tool_calls") => "tool_calls",
+                Some(_) => "other",
+                None => "missing",
+            };
+            // Log response metadata only. Item content and model reasoning stay private.
+            eprintln!(
+                "[yikh assistant] finish_reason={reason} tool_calls={} content_bytes={}",
+                self.message
+                    .as_ref()
+                    .map_or(0, |message| message.tool_calls.len()),
+                self.message
+                    .as_ref()
+                    .and_then(|message| message.content.as_ref())
+                    .map_or(0, String::len),
+            );
+        }
+        // Never execute a partial call, even if the server parsed some arguments.
+        if self.finish_reason.as_deref() == Some("length") {
+            return Err(
+                "Ornithの回答が生成上限で途中終了しました。Itemは変更していません。".into(),
+            );
+        }
+        self.message
+            .ok_or_else(|| "Ornithサーバーから回答を受け取れませんでした。".into())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,8 +535,8 @@ async fn completion(
     decoded
         .choices
         .and_then(|choices| choices.into_iter().next())
-        .and_then(|choice| choice.message)
-        .ok_or_else(|| "Ornithサーバーから回答を受け取れませんでした。".into())
+        .ok_or_else(|| "Ornithサーバーから回答を受け取れませんでした。".to_owned())?
+        .into_answer()
 }
 
 fn snapshot_json(items: &[Item]) -> Result<String, String> {
@@ -640,6 +688,11 @@ mod tests {
                 "required",
             ),
             (
+                "butesにAufyの開発を入れてもらえるかな。予定日はなしで優先度低め、メモにgithubのtwil3akineのgwitgのリポジトリのURLを貼っておいて",
+                "create_item",
+                "required",
+            ),
+            (
                 "OSS課題レポートの締切を10/16にして",
                 "update_item",
                 "required",
@@ -719,6 +772,94 @@ mod tests {
             .err()
             .unwrap()
             .contains("通常の本文"));
+    }
+
+    #[test]
+    fn truncated_responses_do_not_execute_even_parsed_tool_calls() {
+        use super::CompletionChoice;
+        let message = serde_json::json!({"content":null,"tool_calls":[{
+            "id":"partial","type":"function","function":{
+                "name":"create_item","arguments":"{\"kind\":\"bute\",\"title\":\"Aufyの開発\"}"
+            }
+        }]});
+        for message in [message, serde_json::json!({"content":"途中の回答"})] {
+            let choice: CompletionChoice = serde_json::from_value(serde_json::json!({
+                "finish_reason":"length", "message":message,
+            }))
+            .unwrap();
+            assert!(choice.into_answer().err().unwrap().contains("生成上限"));
+        }
+        let choice: CompletionChoice = serde_json::from_value(serde_json::json!({
+            "finish_reason":"stop", "message":{"content":"通常の回答"},
+        }))
+        .unwrap();
+        assert_eq!(
+            choice.into_answer().unwrap().content.as_deref(),
+            Some("通常の回答")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a running llama-server with Ornith; uses only a temporary database"]
+    fn live_ornith_create_with_repository_note() {
+        use super::{answer_with_tools, http_client, ChatMessage, ToolContext};
+        use crate::{
+            assistant_tools::AssistantTools,
+            items::ItemService,
+            model::{ItemInput, ItemQuery},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let service = ItemService::open(directory.path().join("live-smoke.sqlite3")).unwrap();
+        let completed = service
+            .create(ItemInput {
+                kind: ItemKind::Task,
+                title: "OSS課題レポート".into(),
+                notes: String::new(),
+                project: None,
+                scheduled_date: None,
+                due_date: None,
+                priority: Priority::None,
+                tags: vec![],
+            })
+            .unwrap();
+        service.complete(&completed.id).unwrap();
+        let conversation = service.create_conversation().unwrap();
+        let tools = AssistantTools::default();
+        let changed = std::sync::atomic::AtomicUsize::new(0);
+        let notify = || {
+            changed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(answer_with_tools(
+            &service, &http_client().unwrap(),
+            "butesにAufyの開発を入れてもらえるかな。予定日はなしで優先度低め、メモにgithubのtwil3akineのgwitgのリポジトリのURLを貼っておいて".into(),
+            vec![ChatMessage{role:"user".into(),content:"OSSのレポートできた".into()},
+                ChatMessage{role:"assistant".into(),content:"「OSS課題レポート」を完了にしました。".into()}],
+            ToolContext{runtime:&tools,conversation_id:&conversation.conversation.id,on_changed:&notify},
+        ));
+        let reply = result.unwrap_or_else(|error| panic!("Ornith smoke check failed: {error}"));
+        assert!(reply.pending.is_none());
+        let items = service.query(&ItemQuery::default()).unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.title == "Aufyの開発")
+            .expect("created Bute must be in SQLite");
+        assert_eq!(item.kind, ItemKind::Bute);
+        assert_eq!(item.priority, Priority::Low);
+        assert!(
+            item.scheduled_date.is_none()
+                && item.due_date.is_none()
+                && item.project.is_none()
+                && item.tags.is_empty()
+        );
+        assert_eq!(
+            item.notes.to_lowercase(),
+            "https://github.com/twil3akine/gwitg"
+        );
+        assert_eq!(changed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
