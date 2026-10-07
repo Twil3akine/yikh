@@ -25,6 +25,7 @@ pub struct ToolResult {
 pub struct PendingAction {
     pub token: String,
     pub kind: String,
+    pub operation: String,
     pub message: String,
     pub candidates: Vec<ActionCandidate>,
 }
@@ -296,7 +297,7 @@ impl AssistantTools {
                         } else {
                             format!("どのアイテムを更新しますか？候補を選ぶと、次の変更を適用します。\n{}", patch_description(&patch))
                         };
-                        let result = self.make_pending("select", &message, &matches);
+                        let result = self.make_pending("select", name, &message, &matches);
                         store_pending(
                             &mut pending,
                             conversation_id,
@@ -323,6 +324,7 @@ impl AssistantTools {
                     1 if name == "delete_item" => {
                         let result = self.make_pending(
                             "delete",
+                            name,
                             &format!("「{}」を削除しますか？", matches[0].title),
                             &matches,
                         );
@@ -351,7 +353,7 @@ impl AssistantTools {
                         } else {
                             "どのアイテムを削除しますか？".into()
                         };
-                        let result = self.make_pending("select", &message, &matches);
+                        let result = self.make_pending("select", name, &message, &matches);
                         store_pending(&mut pending, conversation_id, &result, matches, op)?;
                         Ok(result)
                     }
@@ -433,6 +435,7 @@ impl AssistantTools {
                         let items = vec![item];
                         let result = self.make_pending(
                             "delete",
+                            "delete_item",
                             &format!("「{}」を削除しますか？", items[0].title),
                             &items,
                         );
@@ -488,7 +491,13 @@ impl AssistantTools {
         Ok(())
     }
 
-    fn make_pending(&self, kind: &str, message: &str, items: &[Item]) -> ToolResult {
+    fn make_pending(
+        &self,
+        kind: &str,
+        operation: &str,
+        message: &str,
+        items: &[Item],
+    ) -> ToolResult {
         let candidates: Vec<_> = items
             .iter()
             .map(|item| ActionCandidate {
@@ -506,6 +515,7 @@ impl AssistantTools {
         let action = PendingAction {
             token: Uuid::new_v4().to_string(),
             kind: kind.to_owned(),
+            operation: operation.to_owned(),
             message: message.to_owned(),
             candidates,
         };
@@ -964,6 +974,7 @@ mod tests {
             assert!(!result.changed);
             let pending = result.pending.unwrap();
             assert_eq!(pending.kind, "select");
+            assert_eq!(pending.operation, tool);
             assert_eq!(pending.candidates.len(), 2);
             assert!(service
                 .query(&ItemQuery::default())
@@ -978,6 +989,7 @@ mod tests {
                 assert!(!result.changed);
                 let confirmation = result.pending.unwrap();
                 assert_eq!(confirmation.kind, "delete");
+                assert_eq!(confirmation.operation, "delete_item");
                 assert_eq!(service.query(&ItemQuery::default()).unwrap().len(), 2);
                 assert!(tools
                     .resolve(&service, "c", &confirmation.token, None, false)

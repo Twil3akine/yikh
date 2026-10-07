@@ -17,7 +17,10 @@ export interface ActionCandidate {
   scheduled_date: string | null; due_date: string | null; priority: Priority;
   status: ItemStatus; notes: string;
 }
-export interface PendingAction { token: string; kind: 'select' | 'delete'; message: string; candidates: ActionCandidate[] }
+export interface PendingAction {
+  token: string; kind: 'select' | 'delete'; operation: 'update_item' | 'complete_item' | 'delete_item';
+  message: string; candidates: ActionCandidate[];
+}
 export interface ConversationDetail { conversation: Conversation; messages: Message[]; pending_action?: PendingAction | null }
 export interface AssistantSettings { base_url: string }
 declare global {

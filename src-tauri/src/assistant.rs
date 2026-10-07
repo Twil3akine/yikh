@@ -1257,6 +1257,7 @@ mod tests {
                 assert!(reply.content.contains("プロジェクト: Automation"));
                 let pending = reply.pending.unwrap();
                 assert_eq!(pending.kind, "select");
+                assert_eq!(pending.operation, "update_item");
                 assert_eq!(pending.candidates.len(), 1);
                 assert_eq!(changes.load(Ordering::SeqCst), 0);
                 let before = service.query(&ItemQuery::default()).unwrap().remove(0);
