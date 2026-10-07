@@ -266,8 +266,11 @@ impl AssistantTools {
         conversation_id: &str,
         name: &str,
         arguments: Value,
-        targets: Option<Vec<Item>>,
+        targets: Option<crate::assistant_targets::TargetResolution>,
     ) -> Result<ToolResult, String> {
+        let needs_confirmation = targets
+            .as_ref()
+            .is_some_and(|targets| targets.needs_confirmation);
         let mut pending = self
             .pending
             .lock()
@@ -281,18 +284,23 @@ impl AssistantTools {
             "update_item" => {
                 let (title, patch) = update_arguments(arguments)?;
                 let matches = match targets {
-                    Some(items) => items,
+                    Some(targets) => targets.items,
                     None => exact_title_matches(service, &title)?,
                 };
                 match matches.len() {
                     0 => Err("該当するアイテムが見つかりません".to_owned()),
-                    1 => update_one(service, &matches[0], patch),
+                    1 if !needs_confirmation => update_one(service, &matches[0], patch),
                     _ => {
-                        let result = self.make_pending(
-                            "select",
-                            "更新するアイテムを選んでください。",
-                            &matches,
-                        );
+                        let message = if matches.len() == 1 {
+                            format!(
+                                "「{}」のことですか？候補を選ぶと、依頼された変更を適用します。",
+                                matches[0].title
+                            )
+                        } else {
+                            "どのアイテムを更新しますか？候補を選ぶと、依頼された変更を適用します。"
+                                .into()
+                        };
+                        let result = self.make_pending("select", &message, &matches);
                         store_pending(
                             &mut pending,
                             conversation_id,
@@ -308,13 +316,15 @@ impl AssistantTools {
                 let args = object(arguments, &["title"])?;
                 let title = required_string(&args, "title")?;
                 let matches = match targets {
-                    Some(items) => items,
+                    Some(targets) => targets.items,
                     None => exact_title_matches(service, &title)?,
                 };
                 match matches.len() {
                     0 => Err("該当するアイテムが見つかりません".to_owned()),
-                    1 if name == "complete_item" => complete_one(service, &matches[0]),
-                    1 => {
+                    1 if name == "complete_item" && !needs_confirmation => {
+                        complete_one(service, &matches[0])
+                    }
+                    1 if name == "delete_item" => {
                         let result = self.make_pending(
                             "delete",
                             &format!("「{}」を削除しますか？", matches[0].title),
@@ -335,12 +345,17 @@ impl AssistantTools {
                         } else {
                             PendingOperation::ChooseDelete
                         };
-                        let message = if name == "complete_item" {
-                            "完了するアイテムを選んでください。"
+                        let message = if name == "complete_item" && matches.len() == 1 {
+                            format!(
+                                "「{}」を完了にする依頼ですか？候補を選ぶと完了にします。",
+                                matches[0].title
+                            )
+                        } else if name == "complete_item" {
+                            "どのアイテムを完了にしますか？".into()
                         } else {
-                            "削除するアイテムを選んでください。"
+                            "どのアイテムを削除しますか？".into()
                         };
-                        let result = self.make_pending("select", message, &matches);
+                        let result = self.make_pending("select", &message, &matches);
                         store_pending(&mut pending, conversation_id, &result, matches, op)?;
                         Ok(result)
                     }

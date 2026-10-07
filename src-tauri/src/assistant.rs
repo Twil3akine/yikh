@@ -240,7 +240,7 @@ const SYSTEM_PROMPT: &str = r#"あなたはYikhのローカル作業アシスタ
 - create_itemとupdate_itemの属性は、各項目に{"value":値,"source":"今回の発言からの引用"}を渡してください。値と引用は必ず同じ項目に置き、別のsourcesマップは作りません。kind、new_title、project、priority、tags、notes、scheduled_date、due_dateが対象です。引用はその属性を指定した最小限の箇所にし、発言全体を無条件に全属性へコピーしないでください。指定されていない項目は渡しません。update_itemには必ず一つ以上の変更項目を含めてください。complete_itemとdelete_itemに属性は不要です。
 - 属性の値は引用の意味に従って正規化します。優先度はnone/low/medium/high、日付はYYYY-MM-DDか相対日付オブジェクトです。メモにURLを求められ、サービスと所有者とリポジトリが明示されている場合は、その指定からURLを組み立てて構いません。知らない所有者やリポジトリを補わないでください。
 - 今日、明日、明後日、一週間後、来週などは相対日付オブジェクトで渡し、実際の日付はRustに解決させてください。来週は次の月曜日、一週間後は7日後、今週は月曜から日曜です。
-- 短縮名に合う候補が複数ある場合は、referenceを特定候補へ勝手に狭めないでください。アプリが候補選択を表示します。同名Itemも勝手に選びません。削除は確認ボタンで承認されるまで実行されません。
+- 短縮名に合う候補が複数ある場合や、対象を断定できない場合は、勝手に一つへ決めず、ユーザーに対象を確認してください。referenceを特定候補へ勝手に狭めないでください。アプリが候補選択の質問を表示します。候補が一つでも照合できなかった場合は、選択されるまで変更しません。削除は確認ボタンで承認されるまで実行されません。
 
 引数の例です。最新一覧に「解析資料づくり」があり、ユーザーが「解析資料の所属を研究へ移して」と頼んだ場合はupdate_itemに次を渡します。
 {"title":"解析資料づくり","project":{"value":"研究","source":"所属を研究へ移して"},"reference":"解析資料"}
@@ -1189,6 +1189,109 @@ mod tests {
                     .is_none());
             }
         }
+    }
+
+    #[test]
+    fn uncertain_target_returns_a_question_and_applies_the_patch_only_after_selection() {
+        use super::{apply_calls, CompletionAnswer, ToolContext};
+        use crate::{
+            assistant_tools::AssistantTools,
+            items::ItemService,
+            model::{ItemInput, ItemQuery},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = ItemService::open(directory.path().join("clarification.sqlite3")).unwrap();
+        let original = service
+            .create(ItemInput {
+                title: "Aufyの開発".into(),
+                kind: ItemKind::Bute,
+                notes: "保持するメモ".into(),
+                project: None,
+                scheduled_date: None,
+                due_date: None,
+                priority: Priority::Low,
+                tags: vec![],
+            })
+            .unwrap();
+        let conversation = service.create_conversation().unwrap();
+        let tools = AssistantTools::default();
+        let changes = AtomicUsize::new(0);
+        let notify = || {
+            changes.fetch_add(1, Ordering::SeqCst);
+        };
+        let context = ToolContext {
+            runtime: &tools,
+            conversation_id: &conversation.conversation.id,
+            on_changed: &notify,
+        };
+        let request = "AufyのプロジェクトをAutomationにしてもらえるかな";
+        let policy = crate::assistant_policy::ItemOperationPolicy::new(
+            request,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(),
+        );
+        let answer = || -> CompletionAnswer {
+            serde_json::from_value(serde_json::json!({"tool_calls":[{"type":"function","function":{
+                "name":"update_item","arguments":sourced_args(request,"Aufyのプロジェクト",
+                    serde_json::json!({"title":"Aufyの開発","project":"Automation"}), &["project"]).to_string()
+            }}]})).unwrap()
+        };
+        // A rejected name interpretation becomes a normal conversation reply,
+        // retaining the requested patch for selection instead of requiring a rephrase.
+        for cancel in [true, false] {
+            let reply = apply_calls(
+                &service,
+                answer(),
+                &context,
+                &policy,
+                &mut vec![],
+                &mut std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(reply.content.contains("のことですか？"));
+            let pending = reply.pending.unwrap();
+            assert_eq!(pending.kind, "select");
+            assert_eq!(pending.candidates.len(), 1);
+            assert_eq!(changes.load(Ordering::SeqCst), 0);
+            let before = service.query(&ItemQuery::default()).unwrap().remove(0);
+            assert!(before.project.is_none());
+            assert_eq!(before.updated_at, original.updated_at);
+            if cancel {
+                tools
+                    .cancel(&conversation.conversation.id, &pending.token)
+                    .unwrap();
+            } else {
+                let result = tools
+                    .resolve(
+                        &service,
+                        &conversation.conversation.id,
+                        &pending.token,
+                        Some(&pending.candidates[0].key),
+                        false,
+                    )
+                    .unwrap();
+                assert!(result.changed && result.pending.is_none());
+                assert!(tools
+                    .resolve(
+                        &service,
+                        &conversation.conversation.id,
+                        &pending.token,
+                        Some(&pending.candidates[0].key),
+                        false
+                    )
+                    .is_err());
+            }
+        }
+        let updated = service.query(&ItemQuery::default()).unwrap().remove(0);
+        assert_eq!(updated.project.as_deref(), Some("Automation"));
+        assert_eq!(updated.priority, original.priority);
+        assert_eq!(updated.notes, original.notes);
+        assert!(tools
+            .pending(&conversation.conversation.id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

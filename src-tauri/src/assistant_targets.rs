@@ -1,30 +1,55 @@
 use crate::model::Item;
 
+pub(crate) struct TargetResolution {
+    pub items: Vec<Item>,
+    pub needs_confirmation: bool,
+}
+
 /// The model extracts a literal name reference; do not parse Japanese operations here.
 /// Return every matching candidate, even when the model supplied one canonical title.
 pub(crate) fn resolve_targets(
     items: Vec<Item>,
     reference: &str,
     tool_title: &str,
-) -> Result<Vec<Item>, String> {
+) -> Result<TargetResolution, String> {
     let reference = normalize(reference);
     let tool_title = normalize(tool_title);
-    if reference.is_empty() || tool_title.is_empty() {
+    if reference.is_empty() || tool_title.is_empty() || items.is_empty() {
         return Err(target_error());
     }
     let matches: Vec<_> = items
-        .into_iter()
+        .iter()
         .filter(|item| contains_name(&normalize(&item.title), &reference))
+        .cloned()
         .collect();
-    if matches.is_empty()
-        || (tool_title != reference
+    if !matches.is_empty() {
+        let needs_confirmation = tool_title != reference
             && !matches
                 .iter()
-                .any(|item| normalize(&item.title) == tool_title))
-    {
-        return Err(target_error());
+                .any(|item| normalize(&item.title) == tool_title);
+        return Ok(TargetResolution {
+            items: matches,
+            needs_confirmation,
+        });
     }
-    Ok(matches)
+    // A model title is only a suggestion when its literal reference did not
+    // resolve. Never execute against a suggested target without user selection.
+    let suggested: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            let title = normalize(&item.title);
+            contains_name(&title, &tool_title) || contains_name(&tool_title, &title)
+        })
+        .cloned()
+        .collect();
+    Ok(TargetResolution {
+        items: if suggested.is_empty() {
+            items
+        } else {
+            suggested
+        },
+        needs_confirmation: true,
+    })
 }
 
 fn target_error() -> String {
@@ -94,9 +119,10 @@ mod tests {
         ];
         for hint in ["Aufy", "Aufyの開発"] {
             let matches = resolve_targets(items.clone(), "Aufy", hint).unwrap();
-            assert_eq!(matches.len(), 2);
-            assert_eq!(matches[0].title, "Aufyの開発");
-            assert_eq!(matches[1].title, "Aufyの検証");
+            assert!(!matches.needs_confirmation);
+            assert_eq!(matches.items.len(), 2);
+            assert_eq!(matches.items[0].title, "Aufyの開発");
+            assert_eq!(matches.items[1].title, "Aufyの検証");
         }
     }
 
@@ -106,24 +132,42 @@ mod tests {
             item("課題", ItemKind::Task, ItemStatus::Active),
             item("課題", ItemKind::Bute, ItemStatus::Completed),
         ];
-        assert_eq!(resolve_targets(items, "課題", "課題").unwrap().len(), 2);
+        assert_eq!(
+            resolve_targets(items, "課題", "課題").unwrap().items.len(),
+            2
+        );
     }
 
     #[test]
-    fn references_are_literal_and_unrelated_hints_are_rejected() {
+    fn uncertain_references_and_inconsistent_titles_require_user_selection() {
         let items = vec![item("Aufyの開発", ItemKind::Bute, ItemStatus::Active)];
-        assert!(resolve_targets(items.clone(), "Aufy", "別の項目").is_err());
-        assert!(resolve_targets(items.clone(), "それ", "Aufyの開発").is_err());
-        assert!(resolve_targets(items.clone(), "AufyのPJを変更して", "Aufyの開発").is_err());
-        assert_eq!(
-            resolve_targets(items, "aufy", "Aufyの開発").unwrap().len(),
-            1
-        );
-        assert!(resolve_targets(
+        for (reference, hint) in [
+            ("Aufy", "別の項目"),
+            ("それ", "Aufyの開発"),
+            ("Aufyのプロジェクト", "Aufyの開発"),
+        ] {
+            let targets = resolve_targets(items.clone(), reference, hint).unwrap();
+            assert!(targets.needs_confirmation);
+            assert_eq!(targets.items[0].title, "Aufyの開発");
+        }
+        let exact = resolve_targets(items, "aufy", "Aufyの開発").unwrap();
+        assert!(!exact.needs_confirmation);
+        assert_eq!(exact.items.len(), 1);
+        let targets = resolve_targets(
             vec![item("AufyNext", ItemKind::Bute, ItemStatus::Active)],
             "Aufy",
-            "AufyNext"
+            "AufyNext",
         )
-        .is_err());
+        .unwrap();
+        assert!(targets.needs_confirmation);
+
+        let all = vec![
+            item("レポート", ItemKind::Task, ItemStatus::Active),
+            item("開発", ItemKind::Bute, ItemStatus::Active),
+        ];
+        let targets = resolve_targets(all, "見つからない名前", "見つからない項目").unwrap();
+        assert!(targets.needs_confirmation);
+        assert_eq!(targets.items.len(), 2);
+        assert!(resolve_targets(vec![], "名前", "項目").is_err());
     }
 }
