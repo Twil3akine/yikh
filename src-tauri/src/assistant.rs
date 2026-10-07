@@ -31,20 +31,62 @@ pub struct ChatMessage {
 #[derive(Debug, Serialize)]
 struct CompletionRequest<'a> {
     model: &'static str,
-    messages: &'a [ApiMessage],
+    messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continue_final_message: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    add_generation_prompt: Option<bool>,
     temperature: f32,
     max_tokens: u32,
     stream: bool,
     chat_template_kwargs: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+impl<'a> CompletionRequest<'a> {
+    fn new(
+        messages: &[ApiMessage],
+        tools: Option<&'a serde_json::Value>,
+        tool_choice: Option<&'a serde_json::Value>,
+    ) -> Self {
+        // llama.cpp's required-tool grammar still allows prose before the call.
+        // Continue at the authorized function's arguments instead. The server
+        // parses the complete call, including this prefill, into OpenAI tool_calls.
+        // Only definitions restricted by ItemOperationPolicy reach this boundary.
+        let function = tools
+            .and_then(serde_json::Value::as_array)
+            .filter(|definitions| definitions.len() == 1)
+            .and_then(|definitions| definitions[0]["function"]["name"].as_str())
+            .filter(|_| tool_choice.and_then(serde_json::Value::as_str) == Some("required"));
+        let mut messages = messages.to_vec();
+        if let Some(function) = function {
+            messages.push(ApiMessage::text(
+                "assistant",
+                format!("<tool_call>\n<function={function}>\n"),
+            ));
+        }
+        Self {
+            model: MODEL_ALIAS,
+            messages,
+            tools,
+            tool_choice,
+            parallel_tool_calls: tools.map(|_| false),
+            continue_final_message: function.map(|_| "content"),
+            add_generation_prompt: function.map(|_| false),
+            temperature: 0.2,
+            max_tokens: 2048,
+            stream: false,
+            chat_template_kwargs: serde_json::json!({"enable_thinking": false}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ApiMessage {
     role: &'static str,
     content: Option<String>,
@@ -504,12 +546,7 @@ async fn completion(
     tool_choice: Option<&serde_json::Value>,
 ) -> Result<CompletionAnswer, String> {
     let response = client.post(endpoint).timeout(REQUEST_TIMEOUT)
-        .json(&CompletionRequest {
-            model: MODEL_ALIAS, messages, tools,
-            tool_choice, parallel_tool_calls: tools.map(|_| false),
-            temperature: 0.2, max_tokens: 2048, stream: false,
-            chat_template_kwargs: serde_json::json!({"enable_thinking": false}),
-        }).send().await.map_err(|error| {
+        .json(&CompletionRequest::new(messages, tools, tool_choice)).send().await.map_err(|error| {
             if error.is_timeout() {
                 "ローカルのOrnithサーバーが時間内に応答しませんでした。サーバーの起動状態を確認してください。".to_owned()
             } else {
@@ -677,7 +714,7 @@ mod tests {
 
     #[test]
     fn mutation_requests_require_only_the_authorized_tool_in_llama_cpp_format() {
-        use super::{tool_definitions, ApiMessage, CompletionRequest, MODEL_ALIAS};
+        use super::{tool_definitions, ApiMessage, CompletionRequest};
         use crate::assistant_policy::ItemOperationPolicy;
 
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
@@ -706,17 +743,11 @@ mod tests {
             let definitions = tool_definitions(&policy);
             let choice = policy.tool_choice();
             let messages = [ApiMessage::text("user", message.into())];
-            let body = serde_json::to_value(CompletionRequest {
-                model: MODEL_ALIAS,
-                messages: &messages,
-                tools: Some(&definitions),
-                tool_choice: Some(&choice),
-                parallel_tool_calls: Some(false),
-                temperature: 0.2,
-                max_tokens: 2048,
-                stream: false,
-                chat_template_kwargs: serde_json::json!({"enable_thinking": false}),
-            })
+            let body = serde_json::to_value(CompletionRequest::new(
+                &messages,
+                Some(&definitions),
+                Some(&choice),
+            ))
             .unwrap();
             assert_eq!(body["tool_choice"], expected_choice, "{message}");
             assert_eq!(body["tools"].as_array().unwrap().len(), 1, "{message}");
@@ -724,6 +755,25 @@ mod tests {
                 body["tools"][0]["function"]["name"], expected_tool,
                 "{message}"
             );
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+            assert_eq!(body["messages"][0]["content"], message);
+            assert_eq!(messages.len(), 1); // Prefill never enters conversation history.
+            if expected_choice == "required" {
+                assert_eq!(body["continue_final_message"], "content");
+                assert_eq!(body["add_generation_prompt"], false);
+                assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+                assert_eq!(body["messages"][1]["role"], "assistant");
+                assert_eq!(
+                    body["messages"][1]["content"],
+                    format!("<tool_call>\n<function={expected_tool}>\n")
+                );
+                assert!(body["messages"][1].get("tool_calls").is_none());
+            } else {
+                assert!(body.get("continue_final_message").is_none());
+                assert!(body.get("add_generation_prompt").is_none());
+                assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+            }
         }
     }
 
