@@ -1,4 +1,4 @@
-use crate::assistant_policy::{date_schema, ItemOperationPolicy};
+use crate::assistant_policy::{date_schema, ItemOperationPolicy, ValidationError};
 use crate::items::ItemService;
 use crate::model::{Item, ItemInput, ItemKind, ItemQuery, ItemStatus, Priority};
 use chrono::NaiveDate;
@@ -18,6 +18,7 @@ pub struct ToolResult {
     pub output: Value,
     pub changed: bool,
     pub pending: Option<PendingAction>,
+    pub needs_clarification: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,27 +219,22 @@ impl AssistantTools {
         arguments: Value,
         policy: &ItemOperationPolicy,
     ) -> Result<ToolResult, String> {
-        let reference = if matches!(
-            name,
-            "create_item" | "update_item" | "complete_item" | "delete_item"
-        ) {
-            Some(
-                arguments
-                    .get("reference")
-                    .and_then(Value::as_str)
-                    .ok_or("対象の参照を指定してください。")?
-                    .to_owned(),
-            )
-        } else {
-            None
+        let validated = match policy.validate(name, arguments) {
+            Ok(validated) => validated,
+            Err(ValidationError::Clarification(question)) => return Ok(clarification(question)),
+            Err(ValidationError::Invalid(error)) => return Err(error),
         };
-        let arguments = policy.validate(name, arguments)?;
+        let arguments = validated.arguments;
         let targets = if matches!(name, "update_item" | "complete_item" | "delete_item") {
+            let items = service.query(&ItemQuery::default())?;
+            if items.is_empty() {
+                return Ok(clarification(
+                    "対象のアイテムが見つかりません。操作したいアイテムのタイトルを教えてください。".into(),
+                ));
+            }
             Some(crate::assistant_targets::resolve_targets(
-                service.query(&ItemQuery::default())?,
-                reference
-                    .as_deref()
-                    .ok_or("対象の参照を指定してください。")?,
+                items,
+                validated.reference.as_deref().unwrap_or_default(),
                 arguments["title"]
                     .as_str()
                     .ok_or("対象のタイトルを指定してください。")?,
@@ -293,12 +289,12 @@ impl AssistantTools {
                     _ => {
                         let message = if matches.len() == 1 {
                             format!(
-                                "「{}」のことですか？候補を選ぶと、依頼された変更を適用します。",
-                                matches[0].title
+                                "「{}」のことですか？候補を選ぶと、次の変更を適用します。\n{}",
+                                matches[0].title,
+                                patch_description(&patch)
                             )
                         } else {
-                            "どのアイテムを更新しますか？候補を選ぶと、依頼された変更を適用します。"
-                                .into()
+                            format!("どのアイテムを更新しますか？候補を選ぶと、次の変更を適用します。\n{}", patch_description(&patch))
                         };
                         let result = self.make_pending("select", &message, &matches);
                         store_pending(
@@ -522,6 +518,7 @@ impl AssistantTools {
             output: json!({"message":message,"candidates":candidate_summary}),
             changed: false,
             pending: Some(action),
+            needs_clarification: false,
         }
     }
 }
@@ -561,6 +558,16 @@ fn success(message: String, item: Option<Item>) -> ToolResult {
         output,
         changed: true,
         pending: None,
+        needs_clarification: false,
+    }
+}
+
+fn clarification(message: String) -> ToolResult {
+    ToolResult {
+        output: json!({"message":message}),
+        changed: false,
+        pending: None,
+        needs_clarification: true,
     }
 }
 
@@ -605,6 +612,7 @@ fn list_items(service: &ItemService, arguments: Value) -> Result<ToolResult, Str
         output: json!({"message":format!("{}件のアイテムが見つかりました。", public.len()),"items":public}),
         changed: false,
         pending: None,
+        needs_clarification: false,
     })
 }
 
@@ -675,6 +683,51 @@ fn update_arguments(arguments: Value) -> Result<(String, ItemPatch), String> {
         tags: optional_strings(&args, "tags")?,
     };
     Ok((title, patch))
+}
+
+fn patch_description(patch: &ItemPatch) -> String {
+    let nullable = |value: &Option<Option<String>>| {
+        value
+            .as_ref()
+            .map(|value| value.clone().unwrap_or_else(|| "未設定".into()))
+    };
+    [
+        ("タイトル", patch.title.clone()),
+        (
+            "種類",
+            patch.kind.map(|kind| match kind {
+                ItemKind::Task => "Task".into(),
+                ItemKind::Bute => "Bute".into(),
+            }),
+        ),
+        ("プロジェクト", nullable(&patch.project)),
+        ("予定日", nullable(&patch.scheduled_date)),
+        ("締切日", nullable(&patch.due_date)),
+        (
+            "優先度",
+            patch.priority.map(|priority| match priority {
+                Priority::None => "未設定".into(),
+                Priority::Low => "低".into(),
+                Priority::Medium => "中".into(),
+                Priority::High => "高".into(),
+            }),
+        ),
+        (
+            "タグ",
+            patch.tags.as_ref().map(|tags| {
+                if tags.is_empty() {
+                    "未設定".into()
+                } else {
+                    tags.join("、")
+                }
+            }),
+        ),
+        ("メモ", patch.notes.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| value.map(|value| format!("{label}: {value}")))
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 fn update_one(
@@ -883,6 +936,81 @@ mod tests {
         }
         object.insert("reference".into(), json!(reference));
         args
+    }
+
+    #[test]
+    fn unquoted_targets_require_selection_and_deletion_still_requires_confirmation() {
+        for tool in ["complete_item", "delete_item"] {
+            let (_directory, service) = service();
+            let tools = AssistantTools::default();
+            for title in ["Aufyの開発", "Aufyの検証"] {
+                tools
+                    .execute_validated(&service, "c", "create_item", create_args(title))
+                    .unwrap();
+            }
+            let policy = ItemOperationPolicy::new(
+                "Aufyを操作して",
+                NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(),
+            );
+            let result = tools
+                .execute(
+                    &service,
+                    "c",
+                    tool,
+                    json!({"title":"Aufy","reference":"Aufyの開発"}),
+                    &policy,
+                )
+                .unwrap();
+            assert!(!result.changed);
+            let pending = result.pending.unwrap();
+            assert_eq!(pending.kind, "select");
+            assert_eq!(pending.candidates.len(), 2);
+            assert!(service
+                .query(&ItemQuery::default())
+                .unwrap()
+                .iter()
+                .all(|item| item.status == ItemStatus::Active));
+            let selected = &pending.candidates[0];
+            let result = tools
+                .resolve(&service, "c", &pending.token, Some(&selected.key), false)
+                .unwrap();
+            if tool == "delete_item" {
+                assert!(!result.changed);
+                let confirmation = result.pending.unwrap();
+                assert_eq!(confirmation.kind, "delete");
+                assert_eq!(service.query(&ItemQuery::default()).unwrap().len(), 2);
+                assert!(tools
+                    .resolve(&service, "c", &confirmation.token, None, false)
+                    .is_err());
+                assert!(
+                    tools
+                        .resolve(&service, "c", &confirmation.token, None, true)
+                        .unwrap()
+                        .changed
+                );
+                let remaining = service.query(&ItemQuery::default()).unwrap();
+                assert_eq!(remaining.len(), 1);
+                assert_ne!(remaining[0].title, selected.title);
+            } else {
+                assert!(result.changed && result.pending.is_none());
+                let items = service.query(&ItemQuery::default()).unwrap();
+                assert_eq!(
+                    items
+                        .iter()
+                        .filter(|item| item.status == ItemStatus::Completed)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    items
+                        .iter()
+                        .find(|item| item.title == selected.title)
+                        .unwrap()
+                        .status,
+                    ItemStatus::Completed
+                );
+            }
+        }
     }
 
     #[test]

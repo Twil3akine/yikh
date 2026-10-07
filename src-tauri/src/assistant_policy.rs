@@ -20,6 +20,31 @@ pub(crate) struct ItemOperationPolicy {
     today: NaiveDate,
 }
 
+#[derive(Debug)]
+pub(crate) struct ValidatedOperation {
+    pub arguments: Value,
+    /// None means the model's target reference needs user confirmation.
+    pub reference: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ValidationError {
+    Invalid(String),
+    Clarification(String),
+}
+
+impl From<String> for ValidationError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for ValidationError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 impl ItemOperationPolicy {
     pub fn new(request: &str, today: NaiveDate) -> Self {
         Self {
@@ -37,7 +62,11 @@ impl ItemOperationPolicy {
         !source.trim().is_empty() && self.request.contains(&source.to_lowercase())
     }
 
-    pub fn validate(&self, name: &str, arguments: Value) -> Result<Value, String> {
+    pub fn validate(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ValidatedOperation, ValidationError> {
         if !matches!(
             name,
             "list_items" | "create_item" | "update_item" | "complete_item" | "delete_item"
@@ -48,16 +77,14 @@ impl ItemOperationPolicy {
             .as_object()
             .cloned()
             .ok_or("Toolの引数はオブジェクトで指定してください。")?;
+        let mut reference = None;
         if name != "list_items" {
-            // The application already binds this policy to the current request.
-            // Asking the model to restate that instruction adds no intent check.
-            let reference = args
+            // Target evidence and attribute evidence are independent. A target
+            // quote mismatch may require selection, but never authorizes a write.
+            reference = args
                 .remove("reference")
                 .and_then(|value| value.as_str().map(str::to_owned))
-                .ok_or("対象名を依頼文から引用してください。")?;
-            if !self.contains_source(&reference) {
-                return Err("Assistantが対象名を依頼文から正しく読み取れませんでした。Itemは変更していません。".into());
-            }
+                .filter(|value| self.contains_source(value));
             // Each supplied field carries its own value and evidence. Reject
             // incomplete arguments instead of silently dropping requested changes.
             for field in MUTABLE_FIELDS {
@@ -78,24 +105,35 @@ impl ItemOperationPolicy {
                     .as_str()
                     .is_some_and(|source| self.contains_source(source))
                 {
-                    return Err("指定項目の根拠が今回のユーザー発言にありません。".into());
+                    let label = field_label(field);
+                    return Err(ValidationError::Clarification(format!(
+                        "{label}の変更内容を確認できませんでした。{label}をどう設定するか教えてください。"
+                    )));
                 }
                 args.insert((*field).into(), attribute["value"].clone());
             }
-            let title = args
-                .get("title")
-                .and_then(Value::as_str)
-                .ok_or("対象のタイトルを指定してください。")?;
+            let title = args.get("title").and_then(Value::as_str).ok_or_else(|| {
+                ValidationError::Clarification(
+                    "どのアイテムを操作しますか？タイトルを教えてください。".into(),
+                )
+            })?;
             if title.trim().is_empty() || (name == "create_item" && !self.contains_source(title)) {
-                return Err("依頼に含まれるItemのタイトルを指定してください。".into());
+                return Err(ValidationError::Clarification(
+                    "操作するアイテムのタイトルを教えてください。".into(),
+                ));
+            }
+            if name == "create_item" && reference.is_none() {
+                return Err(ValidationError::Clarification(
+                    "追加するアイテムのタイトルを教えてください。".into(),
+                ));
             }
             if name == "create_item" && !args.contains_key("kind") {
                 args.insert("kind".into(), json!("task"));
             }
             if name == "update_item" && args.len() == 1 {
-                return Err(
-                    "Assistantが更新内容を読み取れませんでした。Itemは変更していません。".into(),
-                );
+                return Err(ValidationError::Clarification(
+                    "どの項目を、どの値に変更しますか？".into(),
+                ));
             }
         }
         for field in ["scheduled_date", "due_date", "due_from", "due_to"] {
@@ -107,7 +145,10 @@ impl ItemOperationPolicy {
                 args.insert(field.into(), self.resolve_date(value)?);
             }
         }
-        Ok(Value::Object(args))
+        Ok(ValidatedOperation {
+            arguments: Value::Object(args),
+            reference,
+        })
     }
 
     fn resolve_date(&self, value: &Value) -> Result<Value, String> {
@@ -127,6 +168,20 @@ impl ItemOperationPolicy {
             relative.resolve(self.today)?
         };
         Ok(json!(date.format("%Y-%m-%d").to_string()))
+    }
+}
+
+fn field_label(field: &str) -> &str {
+    match field {
+        "kind" => "種類",
+        "new_title" => "タイトル",
+        "priority" => "優先度",
+        "project" => "プロジェクト",
+        "tags" => "タグ",
+        "notes" => "メモ",
+        "scheduled_date" => "予定日",
+        "due_date" => "締切日",
+        _ => field,
     }
 }
 
@@ -179,7 +234,10 @@ mod tests {
         let raw = json!({"title":"Aufyの開発",
             "project":{"value":"Automation","source":"プロジェクトをAutomationにして"},
             "reference":"Aufy"});
-        let args = policy.validate("update_item", raw.clone()).unwrap();
+        let args = policy
+            .validate("update_item", raw.clone())
+            .unwrap()
+            .arguments;
         assert_eq!(args, json!({"title":"Aufyの開発","project":"Automation"}));
         for invalid in [
             json!({"value":"Automation"}),
@@ -193,11 +251,13 @@ mod tests {
         }
         let mut from_snapshot = raw.clone();
         from_snapshot["reference"] = json!("Aufyの開発");
-        assert!(policy.validate("update_item", from_snapshot).is_err());
+        let validated = policy.validate("update_item", from_snapshot).unwrap();
+        assert!(validated.reference.is_none());
+        assert_eq!(validated.arguments["project"], "Automation");
         let mut empty_update = raw;
         empty_update.as_object_mut().unwrap().remove("project");
         let error = policy.validate("update_item", empty_update).unwrap_err();
-        assert!(error.contains("Assistantが更新内容を読み取れませんでした"));
+        assert!(matches!(error, ValidationError::Clarification(_)));
         assert!(policy.validate("external_tool", json!({})).is_err());
     }
 
@@ -211,7 +271,10 @@ mod tests {
             "priority":{"value":"low","source":"低めの優先度"},
             "notes":{"value":"https://github.com/twil3akine/gwitg","source":"メモにはgithubのtwil3akineのgwitgのURLを保存して"},
             "reference":"Aufyの開発"});
-        let args = policy.validate("create_item", raw.clone()).unwrap();
+        let args = policy
+            .validate("create_item", raw.clone())
+            .unwrap()
+            .arguments;
         assert_eq!(args["kind"], "bute");
         assert_eq!(args["priority"], "low");
         assert_eq!(args["notes"], "https://github.com/twil3akine/gwitg");
@@ -227,7 +290,8 @@ mod tests {
                 json!({"title":"Aufyの開発",
             "reference":"Aufyの開発"}),
             )
-            .unwrap();
+            .unwrap()
+            .arguments;
         assert_eq!(args["kind"], "task");
         assert!(args.get("priority").is_none() && args.get("notes").is_none());
     }
@@ -241,7 +305,10 @@ mod tests {
             "scheduled_date":{"value":{"relative":"today"},"source":"今日開始"},
             "due_date":{"value":{"relative":"days_after","days":7},"source":"一週間後締切"},
             "reference":"レポート"});
-        let args = policy.validate("create_item", raw.clone()).unwrap();
+        let args = policy
+            .validate("create_item", raw.clone())
+            .unwrap()
+            .arguments;
         assert_eq!(args["scheduled_date"], "2026-12-30");
         assert_eq!(args["due_date"], "2027-01-06");
         for invalid in [

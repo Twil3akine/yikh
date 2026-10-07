@@ -14,12 +14,12 @@ pub(crate) fn resolve_targets(
 ) -> Result<TargetResolution, String> {
     let reference = normalize(reference);
     let tool_title = normalize(tool_title);
-    if reference.is_empty() || tool_title.is_empty() || items.is_empty() {
+    if tool_title.is_empty() || items.is_empty() {
         return Err(target_error());
     }
     let matches: Vec<_> = items
         .iter()
-        .filter(|item| contains_name(&normalize(&item.title), &reference))
+        .filter(|item| !reference.is_empty() && contains_name(&normalize(&item.title), &reference))
         .cloned()
         .collect();
     if !matches.is_empty() {
