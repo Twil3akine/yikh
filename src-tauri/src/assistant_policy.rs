@@ -142,10 +142,13 @@ impl ItemOperationPolicy {
     }
 
     pub fn tool_choice(&self) -> Value {
-        match self.operation {
-            Some(name) => json!({"type":"function","function":{"name":name}}),
-            None => json!("auto"),
-        }
+        // llama.cpp accepts string choices. Named function objects can fall back
+        // to "auto", so pair "required" with just the requested tool definition.
+        json!(if self.requires_operation() {
+            "required"
+        } else {
+            "auto"
+        })
     }
 
     pub fn requires_operation(&self) -> bool {

@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(item.due_date.as_deref(), Some("2026-10-14"));
         assert_eq!(item.priority, Priority::None);
         assert!(item.project.is_none() && item.tags.is_empty() && item.notes.is_empty());
-        assert_eq!(policy.tool_choice()["function"]["name"], "create_item");
+        assert_eq!(policy.tool_choice(), "required");
 
         let policy = ItemOperationPolicy::new("OSS課題レポートの締切を10/16にして", today);
         let updated = tools

@@ -260,15 +260,7 @@ async fn run(
         "user",
         format!("{context}\n\n質問:\n{message}"),
     ));
-    let definitions = tools.as_ref().map(|_| {
-        let mut definitions = AssistantTools::definitions();
-        definitions.as_array_mut().unwrap().retain(|definition| {
-            definition["function"]["name"]
-                .as_str()
-                .is_some_and(|name| policy.allows(name))
-        });
-        definitions
-    });
+    let definitions = tools.as_ref().map(|_| tool_definitions(&policy));
     let tool_choice = policy.tool_choice();
     let mut executed = HashSet::new();
     // This is a bounded response loop for this user request, not background work.
@@ -307,24 +299,37 @@ async fn run(
     Err("Tool処理の回数が上限に達しました。依頼を短くしてお試しください。".into())
 }
 
+fn tool_definitions(policy: &ItemOperationPolicy) -> serde_json::Value {
+    let mut definitions = AssistantTools::definitions();
+    definitions.as_array_mut().unwrap().retain(|definition| {
+        definition["function"]["name"].as_str().is_some_and(|name| {
+            policy.allows(name) && (!policy.requires_operation() || name != "list_items")
+        })
+    });
+    definitions
+}
+
 fn text_reply(
     response: CompletionAnswer,
     policy: &ItemOperationPolicy,
     tools_available: bool,
 ) -> Result<AssistantReply, String> {
+    if response
+        .content
+        .as_deref()
+        .is_some_and(|text| text.contains("<tool_call>"))
+    {
+        return Err("OrnithのTool Callが通常の本文として返されたため、操作は実行していません。llama-serverの --jinja とチャット解析の設定を確認してください。".into());
+    }
     if tools_available && policy.requires_operation() {
-        return Err("依頼されたToolが呼び出されなかったため、操作は実行していません。llama-serverのTool Calling設定を確認してください。".into());
+        return Err(
+            "Ornithから操作用のTool Callが返されなかったため、Itemは変更していません。".into(),
+        );
     }
     let content = response
         .content
         .filter(|text| !text.trim().is_empty())
         .ok_or("ローカルのOrnithサーバーから空の回答が返されました。")?;
-    if content.contains("<tool_call>") {
-        return Err(
-            "Tool Callを読み取れませんでした。llama-serverを --jinja 付きで起動してください。"
-                .into(),
-        );
-    }
     // A successful write returns directly from apply_calls/resolve using the Rust
     // result. Free model text has no authority to confirm a write, even if intent
     // recognition failed or the server did not produce a structured tool call.
@@ -623,6 +628,53 @@ mod tests {
     }
 
     #[test]
+    fn mutation_requests_require_only_the_authorized_tool_in_llama_cpp_format() {
+        use super::{tool_definitions, ApiMessage, CompletionRequest, MODEL_ALIAS};
+        use crate::assistant_policy::ItemOperationPolicy;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        for (message, expected_tool, expected_choice) in [
+            (
+                "butesにAufyの開発を無期限で入れといて、優先度低めで",
+                "create_item",
+                "required",
+            ),
+            (
+                "OSS課題レポートの締切を10/16にして",
+                "update_item",
+                "required",
+            ),
+            ("OSSのレポートできた", "complete_item", "required"),
+            ("OSS課題レポートを削除して", "delete_item", "required"),
+            ("今週締切のTaskは？", "list_items", "auto"),
+            ("OSS課題レポート終わった？", "list_items", "auto"),
+        ] {
+            let policy = ItemOperationPolicy::new(message, today);
+            let definitions = tool_definitions(&policy);
+            let choice = policy.tool_choice();
+            let messages = [ApiMessage::text("user", message.into())];
+            let body = serde_json::to_value(CompletionRequest {
+                model: MODEL_ALIAS,
+                messages: &messages,
+                tools: Some(&definitions),
+                tool_choice: Some(&choice),
+                parallel_tool_calls: Some(false),
+                temperature: 0.2,
+                max_tokens: 2048,
+                stream: false,
+                chat_template_kwargs: serde_json::json!({"enable_thinking": false}),
+            })
+            .unwrap();
+            assert_eq!(body["tool_choice"], expected_choice, "{message}");
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1, "{message}");
+            assert_eq!(
+                body["tools"][0]["function"]["name"], expected_tool,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn model_text_cannot_claim_item_writes_without_a_tool_result() {
         use super::{text_reply, CompletionAnswer};
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
@@ -659,6 +711,14 @@ mod tests {
             true
         )
         .is_err());
+        let raw_call = CompletionAnswer {
+            content: Some("<tool_call>\n<function=create_item>\n</function>\n</tool_call>".into()),
+            tool_calls: vec![],
+        };
+        assert!(text_reply(raw_call, &policy, true)
+            .err()
+            .unwrap()
+            .contains("通常の本文"));
     }
 
     #[test]
