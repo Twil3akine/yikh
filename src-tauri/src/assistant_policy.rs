@@ -269,6 +269,15 @@ impl ItemOperationPolicy {
             "notes" => &["メモ", "ノート", "notes", "note"],
             _ => return false,
         };
+        if field == "notes" {
+            if let Some(reference) = value.as_str().and_then(github_reference) {
+                // A URL assembled from an explicit owner/repository reference is
+                // still grounded in this request; this does not look up a repository.
+                if self.has_labeled_value(labels, &[&reference]) {
+                    return true;
+                }
+            }
+        }
         let values: Vec<&str> = match (field, value) {
             ("priority", Value::String(value)) => match value.as_str() {
                 "high" => vec!["high", "高", "高め", "高い"],
@@ -410,6 +419,40 @@ impl ItemOperationPolicy {
     }
 }
 
+fn github_reference(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let segments: Vec<_> = url.path_segments()?.collect();
+    if segments.len() != 2
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || *segment == "."
+                || *segment == ".."
+                || !segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || ['-', '_', '.'].contains(&c))
+        })
+    {
+        return None;
+    }
+    if value != format!("https://github.com/{}/{}", segments[0], segments[1]) {
+        return None;
+    }
+    Some(format!(
+        "githubの{}の{}のリポジトリのurl",
+        segments[0], segments[1]
+    ))
+}
+
 fn compact(value: &str) -> String {
     value
         .to_lowercase()
@@ -521,6 +564,32 @@ mod tests {
         ] {
             assert_eq!(relative.resolve(p.today).unwrap().to_string(), expected);
         }
+    }
+
+    #[test]
+    fn explicit_repository_note_keeps_only_the_requested_github_url() {
+        let p = policy("butesにAufyの開発を入れてもらえるかな。予定日はなしで優先度低め、メモにgithubのtwil3akineのgwitgのリポジトリのURLを貼っておいて");
+        assert!(p.requires_operation());
+        for (notes, accepted) in [
+            ("https://github.com/Twil3akine/gwitg", true),
+            ("https://github.com/Twil3akine/yikh", false),
+            ("https://github.com/another/gwitg", false),
+            ("https://example.com/Twil3akine/gwitg", false),
+            ("https://github.com/Twil3akine/gwitg?extra=1", false),
+            ("https://github.com/Twil3akine/gwitg/issues", false),
+        ] {
+            let args = p.validate("create_item", json!({"title":"Aufyの開発","kind":"bute","scheduled_date":null,"priority":"low","notes":notes,"project":"A","tags":["A"]})).unwrap();
+            assert_eq!(
+                args.get("notes").and_then(Value::as_str),
+                accepted.then_some(notes)
+            );
+            assert_eq!(args["priority"], "low");
+            assert!(args.get("scheduled_date").is_none());
+            assert!(args.get("project").is_none() && args.get("tags").is_none());
+        }
+        let p = policy("Aufyの開発をButeで追加して");
+        let args = p.validate("create_item", json!({"title":"Aufyの開発","kind":"bute","notes":"https://github.com/Twil3akine/gwitg"})).unwrap();
+        assert!(args.get("notes").is_none());
     }
 
     #[test]
