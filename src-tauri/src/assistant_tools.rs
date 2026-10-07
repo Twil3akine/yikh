@@ -70,6 +70,17 @@ struct ItemPatch {
 }
 
 impl AssistantTools {
+    pub fn definition(name: &str) -> Result<Value, String> {
+        let definition = Self::definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|definition| definition["function"]["name"] == name)
+            .cloned()
+            .ok_or("利用できない操作です。")?;
+        Ok(json!([definition]))
+    }
+
     pub fn definitions() -> Value {
         let string = |description: &str| json!({"type":"string", "description":description});
         let optional = |props: Map<String, Value>, required: Vec<&str>| json!({"type":"object", "properties":props, "required":required, "additionalProperties":false});
