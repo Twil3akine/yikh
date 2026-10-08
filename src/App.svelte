@@ -142,13 +142,15 @@
   }
   function changeFilter(next: 'all' | ItemKind) { filter = next; void load(); }
   function openAssistant() { assistantOpen = true; fitSidebars(); focusToken += 1; }
+  function toggleAssistant() { if (assistantOpen) closeAssistant(); else openAssistant(); }
   function keyboard(event: KeyboardEvent) {
     if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey || event.isComposing || editing || deleteDialog.open) return;
     const key = event.key.toLowerCase();
-    if (key !== 'b' && key !== 'k') return;
+    if (key !== 'b' && key !== 'k' && key !== 'n') return;
     event.preventDefault();
     if (key === 'b') toggleLeft();
-    else openAssistant();
+    else if (key === 'n') { if (!event.repeat && !working) void openEditor(null); }
+    else if (!event.repeat) toggleAssistant();
   }
   async function openEditor(item: Item | null) {
     error = '';
@@ -187,10 +189,10 @@
       <button class="icon-button" aria-expanded={leftOpen} aria-controls="item-sidebar" aria-label={leftOpen ? 'アイテム一覧を閉じる' : 'アイテム一覧を開く'} title="アイテム一覧を開閉（⌘B）" onclick={toggleLeft}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></svg>
       </button>
-      <button class="icon-button add-item" aria-label="新規追加" title="新規追加" onclick={() => openEditor(null)} disabled={working}><span aria-hidden="true">+</span></button>
+      <button class="icon-button add-item" aria-label="新規追加" title="新規追加（⌘N）" onclick={() => openEditor(null)} disabled={working}><span aria-hidden="true">+</span></button>
     </div>
     <div class="toolbar-group">
-      <button class="icon-button" aria-expanded={assistantOpen} aria-controls="assistant-sidebar" aria-label={assistantOpen ? 'Assistantを閉じる' : 'Assistantを開く'} title="Assistantを開く（⌘K）" onclick={() => assistantOpen ? closeAssistant() : openAssistant()}>
+      <button class="icon-button" aria-expanded={assistantOpen} aria-controls="assistant-sidebar" aria-label={assistantOpen ? 'Assistantを閉じる' : 'Assistantを開く'} title="Assistantを開閉（⌘K）" onclick={toggleAssistant}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></svg>
       </button>
     </div>
