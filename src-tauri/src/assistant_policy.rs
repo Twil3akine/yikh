@@ -1,4 +1,4 @@
-use crate::assistant_dates::resolve_date;
+use crate::assistant_dates::{resolve_date, RequestedDates, DATE_FIELDS};
 use crate::assistant_routing::{ItemPlan, FIELDS as MUTABLE_FIELDS};
 use crate::model::Item;
 use chrono::NaiveDate;
@@ -10,6 +10,7 @@ pub(crate) struct ItemOperationPolicy {
     request: String,
     today: NaiveDate,
     follow_up_target: Option<Item>,
+    requested_dates: Option<RequestedDates>,
 }
 
 #[derive(Debug)]
@@ -43,11 +44,17 @@ impl ItemOperationPolicy {
             request: request.to_lowercase(),
             today,
             follow_up_target: None,
+            requested_dates: None,
         }
     }
 
     pub(crate) fn with_follow_up_target(mut self, target: Option<Item>) -> Self {
         self.follow_up_target = target;
+        self
+    }
+
+    pub(crate) fn with_requested_dates(mut self, dates: RequestedDates) -> Self {
+        self.requested_dates = Some(dates);
         self
     }
 
@@ -81,6 +88,11 @@ impl ItemOperationPolicy {
             args.insert("title".into(), json!(plan.title));
             args.insert("reference".into(), json!(plan.reference));
             for change in plan.changes {
+                if DATE_FIELDS.contains(&change.field.as_str()) {
+                    if let Some(dates) = &self.requested_dates {
+                        dates.validate_change(&change.field, &change.value)?;
+                    }
+                }
                 args.insert(
                     change.field,
                     json!({"value":change.value,"source":change.source}),

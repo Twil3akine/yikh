@@ -113,7 +113,7 @@ pub(crate) struct ItemPlan {
     pub changes: Vec<Change>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Change {
     pub field: String,
