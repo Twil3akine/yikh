@@ -167,7 +167,10 @@ impl ItemOperationPolicy {
                 continue;
             }
             if let Some(value) = args.get(field) {
-                args.insert(field.into(), resolve_date(self.today, value)?);
+                let date = resolve_date(self.today, value).map_err(|error| {
+                    format!("{}の値を確認してください。{error}", field_label(field))
+                })?;
+                args.insert(field.into(), date);
             }
         }
         Ok(ValidatedOperation {

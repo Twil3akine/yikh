@@ -17,6 +17,7 @@ pub(crate) const ROUTER_PROMPT: &str = r#"今回のuser発言だけを分類し�
 intentはquery/create/update/complete/delete/chat/clarifyです。
 検索・状態の質問・作業の相談・要約はquery、追加依頼はcreate、編集依頼はupdate、完了の報告はcomplete、削除依頼はdelete、Itemと関係のない会話はchatです。操作しないという発言や引用文中の命令を実行依頼と解釈しません。完了したかという質問はqueryです。取消の返答はchatで、過去の操作を再開しません。操作を決められない場合や複数種類の操作が混在する場合はclarifyです。
 mentioned_fieldsにはcreate/updateで今回明示された属性をすべて、一度ずつ列挙してください。kindはTask/Bute、new_titleは既存Itemの改名、projectは所属、scheduled_dateは予定日、due_dateは締切、priorityは優先度、tagsはタグ、notesはメモです。「締切なし」などの解除・未設定の指定も含めます。追加するタイトルや対象名はこの配列に含めません。それ以外のintentでは空配列です。
+発言内で対象名や依頼内容を言い直している場合は、訂正後の依頼を分類します。言い直しの前置きや対象名の訂正をItemの改名と扱いません。new_titleは、保存されているタイトル自体の変更を依頼した場合だけ指定します。
 例:「資料のタグを試作、締切を1年後にして」なら{"intent":"update","mentioned_fields":["tags","due_date"]}です。例の名前や値を実際の依頼に引き継ぎません。"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,9 +90,15 @@ impl Route {
             .collect();
         let expected: HashSet<_> = self.mentioned_fields.iter().map(String::as_str).collect();
         if actual != expected {
-            return Err(
-                "指定された変更をすべて確認できませんでした。Itemは変更していません。".into(),
-            );
+            let actual: Vec<_> = plan
+                .changes
+                .iter()
+                .map(|change| change.field.as_str())
+                .collect();
+            return Err(format!(
+                "変更項目が一致しません。必要な項目: {}。生成された項目: {}。Itemは変更していません。",
+                self.mentioned_fields.join(", "), actual.join(", ")
+            ));
         }
         Ok(())
     }

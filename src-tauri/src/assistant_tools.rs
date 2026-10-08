@@ -92,6 +92,54 @@ impl AssistantTools {
         Ok(json!([definition]))
     }
 
+    pub(crate) fn planning_definition(name: &str, fields: &[String]) -> Result<Value, String> {
+        let mut definition = Self::definition(name)?;
+        if !matches!(name, "create_item" | "update_item") {
+            if fields.is_empty() {
+                return Ok(definition);
+            }
+            return Err("この操作では属性を指定できません。".into());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        if fields.iter().any(|field| !seen.insert(field)) {
+            return Err("属性が重複しています。".into());
+        }
+        if name == "create_item" && fields.iter().any(|field| field == "new_title") {
+            return Err("追加時に変更後のタイトルは指定できません。".into());
+        }
+
+        let function = &mut definition[0]["function"];
+        let changes = function["parameters"]["properties"]["changes"]
+            .as_object_mut()
+            .ok_or_else(|| "属性定義を利用できません。".to_owned())?;
+        let variants = changes["items"]["oneOf"]
+            .as_array()
+            .ok_or_else(|| "属性定義を利用できません。".to_owned())?;
+        let mut selected = Vec::new();
+        for field in fields {
+            let variant = variants
+                .iter()
+                .find(|variant| {
+                    variant["properties"]["field"]["enum"][0].as_str() == Some(field.as_str())
+                })
+                .cloned()
+                .ok_or_else(|| format!("未対応の属性です: {field}"))?;
+            selected.push(variant);
+        }
+        changes.insert(
+            "items".into(),
+            if selected.is_empty() {
+                json!({"type":"object"})
+            } else {
+                json!({"oneOf":selected})
+            },
+        );
+        changes.insert("minItems".into(), json!(fields.len()));
+        changes.insert("maxItems".into(), json!(fields.len()));
+        Ok(definition)
+    }
+
     pub fn definitions() -> Value {
         let string = |description: &str| json!({"type":"string", "description":description});
         let optional = |props: Map<String, Value>, required: Vec<&str>| json!({"type":"object", "properties":props, "required":required, "additionalProperties":false});
@@ -1126,6 +1174,58 @@ mod tests {
 
     fn create_args(title: &str) -> Value {
         json!({"kind":"task","title":title,"notes":"keep me","project":"Studio","scheduled_date":"2026-10-08","due_date":"2026-10-12","priority":"high","tags":["ship"]})
+    }
+
+    #[test]
+    fn planning_definition_limits_change_fields_to_requested_subset() {
+        let due_date =
+            AssistantTools::planning_definition("update_item", &["due_date".to_owned()]).unwrap();
+        let due_changes = &due_date[0]["function"]["parameters"]["properties"]["changes"];
+        assert_eq!(due_changes["items"]["oneOf"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            due_changes["items"]["oneOf"][0]["properties"]["field"]["enum"][0],
+            "due_date"
+        );
+        assert_eq!(due_changes["minItems"], 1);
+        assert_eq!(due_changes["maxItems"], 1);
+
+        let subset = AssistantTools::planning_definition(
+            "update_item",
+            &["due_date".to_owned(), "priority".to_owned()],
+        )
+        .unwrap();
+        let subset_changes = &subset[0]["function"]["parameters"]["properties"]["changes"];
+        assert_eq!(
+            subset_changes["items"]["oneOf"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(subset_changes["minItems"], 2);
+        assert_eq!(subset_changes["maxItems"], 2);
+        let empty = AssistantTools::planning_definition("create_item", &[]).unwrap();
+        let empty_changes = &empty[0]["function"]["parameters"]["properties"]["changes"];
+        assert_eq!(empty_changes["maxItems"], 0);
+        assert!(empty_changes["items"].get("oneOf").is_none());
+
+        for name in ["complete_item", "delete_item", "list_items"] {
+            assert_eq!(
+                AssistantTools::planning_definition(name, &[]).unwrap(),
+                AssistantTools::definition(name).unwrap()
+            );
+            assert!(AssistantTools::planning_definition(name, &["due_date".into()]).is_err());
+        }
+
+        for (name, fields) in [
+            ("update_item", vec!["made_up"]),
+            ("update_item", vec!["due_date", "due_date"]),
+            ("create_item", vec!["new_title"]),
+            ("create_item", vec!["made_up"]),
+        ] {
+            assert!(AssistantTools::planning_definition(
+                name,
+                &fields.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            )
+            .is_err());
+        }
     }
 
     fn approve(
