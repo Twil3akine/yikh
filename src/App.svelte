@@ -245,9 +245,9 @@
             <p class="timestamps muted">更新 {dateTime(selected.updated_at)}{#if selected.completed_at}<br />完了 {dateTime(selected.completed_at)}{/if}</p>
           </div>
           <footer class="detail-actions">
+            <button class="danger" disabled={working} onclick={() => selected && confirmDelete(selected)}>削除</button>
+            <button class="edit-button" disabled={working} onclick={() => openEditor(selected ?? null)}>編集</button>
             <button class="primary" disabled={working || selected.status === 'completed'} onclick={() => selected && complete(selected)}>{selected.status === 'completed' ? '完了済み' : '完了'}</button>
-            <button disabled={working} onclick={() => openEditor(selected ?? null)}>編集</button>
-            <button class="danger delete-button" disabled={working} onclick={() => selected && confirmDelete(selected)}>削除</button>
           </footer>
         {:else}<div class="detail-empty"><p>アイテムを選択すると、詳細を表示します。</p></div>{/if}
       </div>

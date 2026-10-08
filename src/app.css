@@ -72,7 +72,7 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .notes p { white-space: pre-wrap; line-height: 1.85; overflow-wrap: anywhere; font-size: 14px; margin: 0; }
 .timestamps { margin-top: 30px; font-size: 11px; line-height: 1.9; }
 .detail-actions { flex-shrink: 0; border-top: 1px solid #e2e6e8; display: flex; gap: 8px; padding: 20px 24px; flex-wrap: wrap; }
-.delete-button { margin-left: auto; }
+.edit-button { margin-left: auto; }
 .detail-empty { padding: 60px 32px; color: #858e95; font-size: 13px; }
 .assistant-panel { flex: 1; min-height: 0; }
 .delete-dialog { border: 1px solid #d9dddf; border-radius: 9px; padding: 26px; width: min(440px, calc(100vw - 64px)); }
