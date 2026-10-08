@@ -1961,7 +1961,7 @@ mod tests {
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for reference in ["Aufyのプロジェクト", "Aufyの開発", ""] {
+        for reference in ["Aufyのプロジェクト", "Aufyの開発"] {
             let directory = tempfile::tempdir().unwrap();
             let service =
                 ItemService::open(directory.path().join("clarification.sqlite3")).unwrap();

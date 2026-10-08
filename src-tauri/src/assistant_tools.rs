@@ -274,6 +274,11 @@ impl AssistantTools {
         };
         let arguments = validated.arguments;
         let targets = if matches!(name, "update_item" | "complete_item" | "delete_item") {
+            if use_follow_up_target && policy.follow_up_target().is_none() {
+                return Ok(clarification(
+                    "どのアイテムを操作しますか？タイトルを教えてください。".into(),
+                ));
+            }
             let items = service.query(&ItemQuery::default())?;
             if items.is_empty() {
                 return Ok(clarification(
@@ -291,13 +296,19 @@ impl AssistantTools {
                     needs_confirmation: false,
                 })
             } else {
-                Some(crate::assistant_targets::resolve_targets(
+                let resolved = crate::assistant_targets::resolve_targets(
                     items,
                     validated.reference.as_deref().unwrap_or_default(),
                     arguments["title"]
                         .as_str()
                         .ok_or("対象のタイトルを指定してください。")?,
-                )?)
+                )?;
+                if resolved.items.is_empty() {
+                    return Ok(clarification(
+                        "対象のアイテムが見つかりません。操作したいアイテムのタイトルを教えてください。".into(),
+                    ));
+                }
+                Some(resolved)
             }
         } else {
             None
@@ -1156,6 +1167,54 @@ mod tests {
         }
         object.insert("reference".into(), json!(reference));
         args
+    }
+
+    #[test]
+    fn missing_targets_ask_for_a_name_without_creating_all_item_candidates() {
+        let (_directory, service) = service();
+        let tools = AssistantTools::default();
+        for title in ["課題", "OSS課題レポート", "Aufyの開発", "gwitgのメンテ"] {
+            create_one(&service, create_arguments(create_args(title)).unwrap()).unwrap();
+        }
+        let before = serde_json::to_value(service.query(&ItemQuery::default()).unwrap()).unwrap();
+        for (request, reference, title) in [
+            ("締切日も一ヶ月後にお願いできるかな", "", "締切日"),
+            ("締切日も一ヶ月後にお願いできるかな", "", "gwitgのメンテ"),
+            (
+                "見つからない名前の締切日を一ヶ月後にして",
+                "見つからない名前",
+                "見つからない名前",
+            ),
+        ] {
+            let policy =
+                ItemOperationPolicy::new(request, NaiveDate::from_ymd_opt(2026, 10, 8).unwrap());
+            let result = tools
+                .execute(
+                    &service,
+                    "c",
+                    "update_item",
+                    json!({
+                        "title":title,"reference":reference,"changes":[{
+                            "field":"due_date","value":{"relative":"months_after","months":1},
+                            "source":"一ヶ月後"
+                        }]
+                    }),
+                    &policy,
+                )
+                .unwrap();
+            assert!(result.needs_clarification);
+            assert!(result.output["message"]
+                .as_str()
+                .unwrap()
+                .contains("タイトルを教えてください"));
+            assert!(!result.changed);
+            assert!(result.pending.is_none());
+            assert!(tools.pending("c").unwrap().is_none());
+            assert_eq!(
+                serde_json::to_value(service.query(&ItemQuery::default()).unwrap()).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]

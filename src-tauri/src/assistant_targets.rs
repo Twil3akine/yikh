@@ -43,11 +43,8 @@ pub(crate) fn resolve_targets(
         .cloned()
         .collect();
     Ok(TargetResolution {
-        items: if suggested.is_empty() {
-            items
-        } else {
-            suggested
-        },
+        // No match means no candidate, rather than every Item in the database.
+        items: suggested,
         needs_confirmation: true,
     })
 }
@@ -167,7 +164,7 @@ mod tests {
         ];
         let targets = resolve_targets(all, "見つからない名前", "見つからない項目").unwrap();
         assert!(targets.needs_confirmation);
-        assert_eq!(targets.items.len(), 2);
+        assert!(targets.items.is_empty());
         assert!(resolve_targets(vec![], "名前", "項目").is_err());
     }
 }
